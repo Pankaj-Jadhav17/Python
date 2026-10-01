@@ -1,324 +1,111 @@
 # Project Overview
 
-This repository contains a full-stack application (backend + frontend) with container orchestration and local development helpers.
+This repository contains a full-stack application with a Python backend, a frontend, and Docker-based services. The backend also implements PDF ingestion and Neo4j knowledge-graph generation.
 
-Paths referenced in this README are relative to the repository root.
+## PDF-to-Neo4j task
 
-**Contents:**
-- **Backend:** `app/backend` (Python project; see `app/backend/pyproject.toml`)
-- **Frontend:** `app/frontend` (Node/React/TS project; see `app/frontend/package.json`)
-- **Containers:** `app/docker-compose.yml` and `app/Dockerfile`
-- **Docs:** `app/docs`
+The backend accepts a PDF, extracts its text with PyPDF, identifies entities and selected relationships, and stores the resulting document graph in Neo4j. Graph data is available through API endpoints and a browser-based graph view.
 
-**Goal of this README:** Provide a clear, step-by-step guide to get the project running locally, how the code is organized, how to run tests, and a small helper script to automate setup.
+Task flow:
 
----
+1. Upload a PDF through the API.
+2. Extract text from the PDF.
+3. Detect entities and relationships.
+4. Store document and entity nodes and their edges in Neo4j.
+5. Retrieve the graph as JSON or view it on the graph page.
 
-## Prerequisites
+The entity and relationship extraction is a lightweight demo implementation, not a general-purpose semantic extraction model.
 
-- Install Docker and Docker Compose (or Docker with the `docker compose` plugin).
-- Install Node.js (LTS) and `npm` or `pnpm` for the frontend.
-- Install Python 3.8+ and `pip` for the backend.
-- Optional: `poetry` if you prefer using it for Python dependency management.
+## Quick start
 
-Verify basic commands work:
+### 1. Start Neo4j
 
-```bash
-docker --version
-docker compose version  # or: docker-compose --version
-node --version
-npm --version
-python3 --version
+Make sure Docker Desktop is running, then start Neo4j from the app folder:
+
+```powershell
+cd "D:\ML_Project\Python\app"
+docker compose up -d --wait neo4j
+docker compose ps neo4j
 ```
 
----
+Neo4j Browser is available at `http://localhost:7474`. The Compose defaults are username `neo4j` and password `your_neo4j_password`; change these for non-local use.
 
-## Quick automated setup (recommended)
+### 2. Start the backend
 
-A helper script `setup.sh` (in project root) performs typical setup tasks:
+In a separate PowerShell terminal:
 
-- Installs backend dependencies (using `poetry` if available, otherwise creates a Python venv and uses `pip install .`).
-- Installs frontend dependencies with `npm install`.
-- Builds and starts services via Docker Compose.
-
-Run the script from the repository root:
-
-```bash
-./setup.sh
+```powershell
+cd "D:\ML_Project\Python\app\backend"
+$env:PYTHONPATH = "$PWD"
+.\venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-If you prefer to avoid starting containers, run only the dependency setup steps (see manual setup below).
+If port 8000 is already in use, choose another port, such as 8003, and use that same port in the URLs below.
 
----
+### 3. Open the app
 
-## Manual setup (step-by-step)
+- Swagger API docs: `http://localhost:8000/docs`
+- Visual graph page: `http://localhost:8000/graph-view`
+- API health check: `http://localhost:8000/`
+- Neo4j Browser: `http://localhost:7474`
 
-1) Backend
+Use `localhost` in the browser. `0.0.0.0` is the server bind address, not the browser URL.
 
- - Change directory to the backend:
+### 4. Upload a PDF and view its graph
 
-```bash
-cd app/backend
+In Swagger, open `POST /api/documents/upload`, choose a PDF, and execute the request. Then open the graph page and enter the uploaded PDF's exact filename. The page requests the graph from the backend and draws its nodes and edges.
+
+To inspect JSON directly, use this PowerShell command, replacing the filename if needed:
+
+```powershell
+Invoke-RestMethod -Uri 'http://localhost:8000/api/graph/graph?document_name=demo_graph.pdf' | ConvertTo-Json -Depth 20
 ```
 
- - If you use `poetry`:
+## API endpoints
 
-```bash
-poetry install
+- `POST /api/documents/upload` uploads a PDF, extracts its text, and creates its graph.
+- `POST /api/graph/ingest` creates a graph from a document name and raw text.
+- `GET /api/graph/graph` returns graph nodes and edges. The optional `document_name` query filters by document.
+- `GET /api/graph/summary` returns graph counts by document.
+
+Example text-ingestion request:
+
+```powershell
+$body = @{
+   document_name = 'demo_graph.pdf'
+   text = 'Machine learning helps healthcare. Deep learning is used in cancer detection.'
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+   -Uri 'http://localhost:8000/api/graph/ingest' `
+   -ContentType 'application/json' `
+   -Body $body
 ```
 
- - Otherwise create a virtual environment and install with `pip`:
+The graph response contains `nodes` (documents and entities) and `edges` (their relationships).
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install .
-```
-
- - Environment variables: create an `.env` file or export variables required by the backend (examples are usually documented near `app/backend/README.md` or in source config).
-
-2) Frontend
-
-```bash
-cd app/frontend
-npm install
-npm run dev      # or `npm run start` depending on the project scripts
-```
-
-3) Containers (optional but recommended for services like databases)
-
-From the repository root, start containers:
-
-```bash
-cd app
-docker compose up -d --build    # or: docker-compose up -d --build
-```
-
-The helper `setup.sh` will attempt the correct compose command automatically.
-
----
-
-## Running the application
-
-- Backend typical URL: `http://localhost:8000` (adjust if your app uses a different port)
-- Frontend typical URL: `http://localhost:3000`
-
-Check container logs with:
-
-```bash
-docker compose logs -f    # or: docker-compose logs -f
-```
-
-Stop containers:
-
-```bash
-docker compose down
-```
-
----
-
-## Tests
-
-Backend tests are under `app/tests`. Run them using the test runner configured in the backend (pytest is common):
-
-```bash
-cd app/backend
-source .venv/bin/activate   # if you created a venv
-pytest -q
-```
-
-Frontend tests (if present) run via npm scripts:
-
-```bash
-cd app/frontend
-npm test
-```
-
----
-
-## Project structure (detailed)
+## Project structure
 
 ```text
 app/
-├── backend/         # Python package; services, controllers, models, tests
-│   ├── pyproject.toml
-│   ├── app/         # application package
-│   │   ├── api/
-│   │   ├── controllers/
-│   │   ├── services/
-│   │   └── tests/
-│   └── tests/
-├── frontend/        # Node/React/TypeScript app
-├── docker/          # helper docker resources (per-service folders)
-├── docs/            # project documentation
+├── backend/       Python API, graph service, and tests
+├── frontend/      React frontend
+├── docs/          Project documentation
 ├── docker-compose.yml
+├── Dockerfile
 └── readme.md
 ```
 
-Key locations:
-- `app/backend/app` : backend source code and modules
-- `app/frontend`    : frontend source and build config
-- `app/docker`      : containers and DB init scripts
+## Tests
 
----
+From `app/backend`, run the focused graph-service test with:
 
-## Troubleshooting
-
-- If `docker compose` is not available, try `docker-compose` (older CLI).
-- If backend install fails with PEP517/pyproject errors, ensure `pip` is up-to-date: `python3 -m pip install -U pip build` then `pip install .`.
-- File permissions: make `setup.sh` executable: `chmod +x setup.sh`.
-
----
-
-## Contributing
-
-- Fork and create feature branches.
-- Follow the repository's linting and testing conventions.
-
----
-
----
-
-## Helper script (embedded)
-
-Below is a self-contained setup script you can copy into a file named `setup.sh` at the repository root. It automates backend/frontend dependency installation and can start Docker Compose. Save it, make it executable with `chmod +x setup.sh`, and run `./setup.sh`.
-
-```bash
-#!/usr/bin/env bash
-
-# setup.sh - Project setup helper
-# Usage: ./setup.sh [--no-docker] [--no-frontend] [--no-backend]
-
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$ROOT_DIR/app"
-BACKEND_DIR="$APP_DIR/backend"
-FRONTEND_DIR="$APP_DIR/frontend"
-
-SKIP_DOCKER=0
-SKIP_FRONTEND=0
-SKIP_BACKEND=0
-
-for arg in "$@"; do
-	case "$arg" in
-		--no-docker) SKIP_DOCKER=1 ;;
-		--no-frontend) SKIP_FRONTEND=1 ;;
-		--no-backend) SKIP_BACKEND=1 ;;
-		-h|--help)
-			echo "Usage: $0 [--no-docker] [--no-frontend] [--no-backend]"
-			exit 0
-			;;
-		*) echo "Unknown argument: $arg"; exit 2 ;;
-	esac
-done
-
-check_cmd() {
-	command -v "$1" >/dev/null 2>&1 || { echo "Required command '$1' not found. Please install it and retry."; exit 1; }
-}
-
-install_backend() {
-	if [ "$SKIP_BACKEND" -eq 1 ]; then
-		echo "Skipping backend setup."; return
-	fi
-	echo "Setting up backend in $BACKEND_DIR"
-	if [ ! -d "$BACKEND_DIR" ]; then
-		echo "Backend directory not found: $BACKEND_DIR"; return
-	fi
-
-	pushd "$BACKEND_DIR" >/dev/null
-
-	if [ -f "pyproject.toml" ]; then
-		if command -v poetry >/dev/null 2>&1; then
-			echo "Installing backend dependencies with poetry..."
-			poetry install
-		else
-			echo "No poetry detected. Creating venv and installing with pip..."
-			python3 -m venv .venv
-			. .venv/bin/activate
-			pip install -U pip build
-			pip install .
-		fi
-	elif [ -f "requirements.txt" ]; then
-		echo "Creating venv and installing requirements.txt..."
-		python3 -m venv .venv
-		. .venv/bin/activate
-		pip install -U pip
-		pip install -r requirements.txt
-	else
-		echo "No pyproject.toml or requirements.txt found — skipping backend install."
-	fi
-
-	popd >/dev/null
-}
-
-install_frontend() {
-	if [ "$SKIP_FRONTEND" -eq 1 ]; then
-		echo "Skipping frontend setup."; return
-	fi
-	echo "Setting up frontend in $FRONTEND_DIR"
-	if [ ! -d "$FRONTEND_DIR" ]; then
-		echo "Frontend directory not found: $FRONTEND_DIR"; return
-	fi
-	pushd "$FRONTEND_DIR" >/dev/null
-	if [ -f "package.json" ]; then
-		if command -v npm >/dev/null 2>&1; then
-			npm install
-		else
-			echo "npm not found — please install Node.js and npm to setup the frontend."; popd >/dev/null; return
-		fi
-	else
-		echo "No package.json found in frontend — skipping frontend install."
-	fi
-	popd >/dev/null
-}
-
-start_docker() {
-	if [ "$SKIP_DOCKER" -eq 1 ]; then
-		echo "Skipping docker compose up."; return
-	fi
-	echo "Starting Docker Compose from $APP_DIR"
-	pushd "$APP_DIR" >/dev/null
-	if command -v docker >/dev/null 2>&1; then
-		if docker compose version >/dev/null 2>&1; then
-			docker compose up -d --build
-		elif command -v docker-compose >/dev/null 2>&1; then
-			docker-compose up -d --build
-		else
-			echo "docker compose plugin not found and docker-compose not found. Please install one."; popd >/dev/null; exit 1
-		fi
-	else
-		echo "Docker not found. Please install Docker to run services."; popd >/dev/null; exit 1
-	fi
-	popd >/dev/null
-}
-
-main() {
-	echo "Project setup started from: $ROOT_DIR"
-
-	# Basic checks
-	check_cmd python3 || true
-
-	# Backend
-	install_backend
-
-	# Frontend
-	install_frontend
-
-	# Docker / containers
-	start_docker
-
-	echo "Setup complete."
-	echo "Backend: http://localhost:8000 (if running)"
-	echo "Frontend: http://localhost:3000 (if running)"
-}
-
-main
+```powershell
+.\venv\Scripts\python.exe -m pytest tests/test_pdf_graph_service.py -q
 ```
 
-You told me not to keep the file in the repo — this embedded block lets you copy the script when you need it.
+## Notes
 
-If you want, I can paste this script into a new `setup.sh` file again or further adapt it to your preferred package managers.
-
-Thank you — tell me which of the options above you want next.
+- Neo4j must be running before uploading or ingesting graph data.
+- Keep local credentials in environment configuration and use secure credentials outside development.
+- The API root returns `{"status": "running"}` as a health check; graph data is available from the graph endpoints or visual graph page.
