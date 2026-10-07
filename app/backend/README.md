@@ -1,13 +1,14 @@
 http://0.0.0.0:8000http://0.0.0.0:8000http://0.0.0.0:8000http://0.0.0.0:8000http://0.0.0.0:8000# PDF Ingestion + Neo4j Graph Backend
 
-This backend ingests PDF files, extracts key entities and relationships, and creates a Neo4j knowledge graph from the document content.
+This backend ingests PDF, DOCX, and TXT files and uses a local Ollama model to create evidence-grounded Neo4j knowledge graphs.
 
 ## Current task status
 
 - PDF upload support: implemented
-- Text extraction: implemented
-- Entity and relationship detection: implemented
-- Neo4j graph generation: implemented
+- Text extraction and PDF page ranges: implemented with PyMuPDF
+- Ollama triple extraction and evidence validation: implemented
+- Low-confidence second-pass review and rejected-attempt logging: implemented
+- Document, Passage, Concept, and RELATES provenance graph: implemented
 - Graph summary endpoint: implemented
 - Swagger UI: available at `/docs`
 - Visual graph page: available at `/graph-view`
@@ -72,7 +73,27 @@ NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_neo4j_password
 CORS_ORIGINS=http://localhost:5173
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:latest
+OLLAMA_TIMEOUT_SECONDS=180
+OLLAMA_CONFIDENCE_THRESHOLD=0.72
+OLLAMA_NUM_PREDICT=384
 ```
+
+Ollama must be running locally with the configured model installed (`ollama pull llama3.2:latest`). The upload endpoint checks that the model is available before extraction begins.
+
+## Evidence graph
+
+For each bounded passage, Ollama returns `subject`, `relation`, `object`, a verbatim `evidence` quote, and `confidence`. The backend rejects triples with an unsupported relation, a quote not found in the passage, or a subject/object missing from the quote. Candidates below the confidence threshold are sent to a second Ollama review and stored as `verified`, `rejected`, or `pending`.
+
+Neo4j stores:
+
+- `(:Document)-[:HAS_PASSAGE]->(:Passage)` with page, offsets, passage ID, and source text
+- `(:Passage)-[:MENTIONS]->(:Concept)` for canonicalized concepts
+- `(:Concept)-[:RELATES]->(:Concept)` with relation, evidence, passage ID, page, offsets, confidence, status, review reason, and model
+- `(:Passage)-[:HAS_EXTRACTION]->(:ExtractionAttempt)` for rejected and reviewed candidate audit records
+
+For the supplied NCERT Biology PDF, Chapter 1 is extracted from PDF pages 3–25. Use `start_page` and `end_page` query parameters on the upload endpoint to scope other PDF chapters.
 
 ## Docker for Neo4j
 
@@ -85,5 +106,5 @@ docker compose up -d
 
 ## Notes
 
-- The current implementation is a working lightweight knowledge graph builder based on document text.
-- It is suitable for demo and learning projects, and can be extended with an LLM extractor or richer entity recognition later.
+- Extraction is evidence-first but still depends on the local model's quality and the configured relation vocabulary.
+- Scanned PDFs require OCR before text extraction.

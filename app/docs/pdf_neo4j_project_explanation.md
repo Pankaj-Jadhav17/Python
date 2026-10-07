@@ -46,11 +46,12 @@ So this project is a basic example of:
 The implementation includes:
 
 - A FastAPI backend
-- PDF upload support
-- Text extraction using PyPDF
+- PDF, DOCX, and TXT upload support
+- Text extraction by selected PDF page range, DOCX paragraph, and TXT file chunk
 - Basic entity detection
 - Relationship detection
 - Neo4j graph storage
+- A React upload screen that displays the generated graph
 - API endpoints for upload and graph access
 
 Important files in the project:
@@ -128,13 +129,11 @@ The user sends a PDF file to the API endpoint:
 POST /api/documents/upload
 ```
 
-The backend receives the file and validates that it is a PDF.
+The backend receives the file and validates that it is a PDF, DOCX, or TXT file. It streams the upload to a temporary file in 1 MB pieces, then removes that file after processing.
 
 ### Step 2: Read PDF content
 
-The project uses PyPDF to open the PDF and extract text from each page.
-
-This text is converted into a clean string.
+PyMuPDF yields PDF page text incrementally and can restrict extraction to a requested PDF page range. DOCX files are read paragraph by paragraph, and TXT files are read in 64 KB blocks with a small overlap so words around block boundaries are retained. The complete extracted document is not joined into one large string.
 
 ### Step 3: Extract entities
 
@@ -189,35 +188,23 @@ The API can return data in a simple JSON format:
 }
 ```
 
+The React screen receives this response directly after upload, displays the document and entity nodes with labeled connections, and reports graph counts. It draws up to 24 nodes in the current viewport for readability; the complete graph is stored in Neo4j and is available from the graph API.
+
+Large-file handling is bounded by available disk, Neo4j resources, server or reverse-proxy request limits, and request timeouts. This implementation streams upload bytes and extracts text incrementally, but it is not literally unlimited: it retains unique graph entities and relationships in memory and returns graph data in the upload response. Scanned PDFs require OCR first. Entity and relation extraction is rule-based and currently recognizes a small set of relationship patterns; old `.doc` files are not supported and should be converted to `.docx`.
+
 This is the graph output the app is designed to show.
 
 ---
 
-## 8. What does the service file do?
+## 8. What does the evidence graph service do?
 
-The main logic is in [Python/app/backend/app/services/pdf_graph_service.py](../backend/app/services/pdf_graph_service.py).
+The extraction pipeline is in [Python/app/backend/app/services/evidence_graph_service.py](../backend/app/services/evidence_graph_service.py). `iter_passages` extracts page-scoped text and assigns a stable passage ID, page number, and character offsets.
 
-This file has functions like:
+For each passage, Ollama returns a structured list of subject, relation, object, evidence quote, and confidence. `validate_candidate` checks the relation allow-list, verifies the exact quote occurs in that passage, and verifies both endpoints occur in the quote. Rejections are logged and persisted as `ExtractionAttempt` nodes.
 
-### extract_text_from_pdf(file_path)
-This reads the PDF and returns text.
+Candidates below the configured confidence threshold receive a second Ollama review. Results are marked `verified`, `rejected`, or `pending`. Entity names are resolved to canonical `Concept` names and aliases before Neo4j writes.
 
-### extract_entities_and_relationships(text)
-This analyzes the text and returns:
-
-- entity list
-- relationship list
-
-### create_graph(document_name, text)
-This writes the graph into Neo4j.
-
-### get_graph_data(document_name)
-This returns the graph in a structured format for use in APIs.
-
-### get_graph_summary()
-This returns document counts and relationship counts.
-
-This is the heart of the app because it connects PDF content to graph data.
+The stored graph contains `Document`, `Passage`, and `Concept` nodes; `HAS_PASSAGE`, `MENTIONS`, and `HAS_EXTRACTION` links; and evidence-bearing `RELATES` edges. Each `RELATES` edge stores the evidence, passage ID, page, offsets, confidence, status, review reason, and model name.
 
 ---
 

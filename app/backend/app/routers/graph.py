@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services.pdf_graph_service import PDFGraphService
+from app.services.evidence_graph_service import EvidenceGraphService
 
 router = APIRouter()
-service = PDFGraphService()
+service = EvidenceGraphService()
 
 
 class GraphIngestRequest(BaseModel):
@@ -17,9 +17,10 @@ def ingest_graph(payload: GraphIngestRequest):
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    result = service.create_graph(payload.document_name, payload.text)
+    service.check_ollama()
+    result = service.create_evidence_graph_from_text(payload.document_name, payload.text)
     return {
-        "message": "Graph created from text successfully.",
+        "message": "Evidence graph created from text successfully.",
         **result,
     }
 
