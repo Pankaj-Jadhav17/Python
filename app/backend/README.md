@@ -12,6 +12,7 @@ This backend ingests PDF, DOCX, and TXT files and uses a local Ollama model to c
 - Graph summary endpoint: implemented
 - Swagger UI: available at `/docs`
 - Visual graph page: available at `/graph-view`
+- Frontend Q&A page: chat and answer-path graph; documents are ingested separately through the backend API
 
 ## Task description
 
@@ -40,6 +41,15 @@ Then open:
 - `POST /api/graph/ingest` → create graph from raw text
 - `GET /api/graph/summary` → graph statistics
 - `GET /api/graph/graph` → graph nodes and edges payload
+- `POST /ask` → evidence-grounded answer, graph path, and source evidence
+
+Example request:
+
+```json
+{"question": "How are microspores connected to pollen grains?"}
+```
+
+The `/ask` LangGraph workflow selects a fixed path or neighborhood lookup, matches extracted concept names to Neo4j concepts with Ollama embeddings, runs a parameterized Cypher query over verified relationships, and asks the configured chat model to answer from only the retrieved evidence. It does not allow the model to generate Cypher. Its response contains `answer`, `path` (`nodes` and `edges`), and `evidence`; the frontend displays the answer and highlights the returned path.
 
 ## Example output
 
@@ -75,12 +85,15 @@ NEO4J_PASSWORD=your_neo4j_password
 CORS_ORIGINS=http://localhost:5173
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:latest
+OLLAMA_EMBEDDING_MODEL=embeddinggemma:latest
 OLLAMA_TIMEOUT_SECONDS=180
 OLLAMA_CONFIDENCE_THRESHOLD=0.72
 OLLAMA_NUM_PREDICT=384
+ASK_CONCEPT_SIMILARITY_THRESHOLD=0.35
+ASK_MAX_CONCEPTS=2000
 ```
 
-Ollama must be running locally with the configured model installed (`ollama pull llama3.2:latest`). The upload endpoint checks that the model is available before extraction begins.
+Ollama must be running locally with the configured chat and embedding models installed (`ollama pull llama3.2:latest` and `ollama pull embeddinggemma:latest`). EmbeddingGemma is used for matching user concepts to stored graph concepts; `OLLAMA_MODEL` remains the answer/planning chat model. Install backend dependencies from `pyproject.toml` before running the API.
 
 ## Evidence graph
 
