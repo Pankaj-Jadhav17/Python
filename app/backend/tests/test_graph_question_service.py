@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from GraphRAG.db import GraphRAGStore
 from app.main import app
 from app.routers import ask
 from app.services.graph_question_service import PLAN_SCHEMA, GraphQuestionService
@@ -164,6 +165,42 @@ def test_path_tool_returns_ordered_path_and_evidence():
     assert "shortestPath" in path_query
     assert "r.status = 'verified'" in path_query
     assert path_parameters["concept_names"] == ["alpha", "beta"]
+
+
+def test_graph_summary_includes_relationship_count_for_frontend_usage():
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def run(self, query: str, **parameters):
+            assert "COUNT(DISTINCT r) AS relationship_count" in query
+            return [
+                {
+                    "document_name": "biology.pdf",
+                    "passage_count": 4,
+                    "concept_count": 7,
+                    "relationship_count": 12,
+                }
+            ]
+
+    class Driver:
+        def session(self):
+            return Session()
+
+    store = GraphRAGStore.__new__(GraphRAGStore)
+    store.driver = Driver()
+
+    assert store.get_graph_summary() == [
+        {
+            "document_name": "biology.pdf",
+            "passage_count": 4,
+            "concept_count": 7,
+            "relationship_count": 12,
+        }
+    ]
 
 
 def test_ask_endpoint_returns_answer_path_and_evidence(monkeypatch):

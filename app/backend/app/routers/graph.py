@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services.evidence_graph_service import EvidenceGraphService
+from GraphRAG.db import GraphRAGStore
 
 router = APIRouter()
-service = EvidenceGraphService()
+service = GraphRAGStore()
 
 
 class GraphIngestRequest(BaseModel):
@@ -17,8 +17,9 @@ def ingest_graph(payload: GraphIngestRequest):
     if not payload.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    service.check_ollama()
-    result = service.create_evidence_graph_from_text(payload.document_name, payload.text)
+    from GraphRAG.ingest import ingest_document_text
+
+    result = ingest_document_text(payload.document_name, payload.text)
     return {
         "message": "Evidence graph created from text successfully.",
         **result,

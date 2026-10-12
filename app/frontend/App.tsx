@@ -56,12 +56,22 @@ type GraphViewProps = {
   edges: GraphEdge[];
   highlightedNodeIds: Set<string>;
   highlightedEdgeKeys: Set<string>;
+  selectedNodeId?: string | null;
   onEdgeSelect: (edge: GraphEdge | null) => void;
+  onNodeSelect?: (nodeId: string | null) => void;
 };
 
 type ViewLink = { source: string; target: string; key: string; edge: GraphEdge };
 
-function GraphView({ nodes, edges, highlightedNodeIds, highlightedEdgeKeys, onEdgeSelect }: GraphViewProps) {
+function GraphView({
+  nodes,
+  edges,
+  highlightedNodeIds,
+  highlightedEdgeKeys,
+  selectedNodeId,
+  onEdgeSelect,
+  onNodeSelect,
+}: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<ForceGraph3DInstance | null>(null);
   const onEdgeSelectRef = useRef(onEdgeSelect);
@@ -88,9 +98,12 @@ function GraphView({ nodes, edges, highlightedNodeIds, highlightedEdgeKeys, onEd
       .linkDirectionalArrowLength(4)
       .linkDirectionalArrowRelPos(1)
       .onLinkClick((l) => onEdgeSelectRef.current((l as ViewLink).edge))
-      .onBackgroundClick(() => onEdgeSelectRef.current(null))
+      .onBackgroundClick(() => {
+        onEdgeSelectRef.current(null);
+        onNodeSelect?.(null);
+      })
       .onNodeClick((n) => {
-        const node = n as { x?: number; y?: number; z?: number };
+        const node = n as GraphNode & { x?: number; y?: number; z?: number };
         if (node.x === undefined || node.y === undefined || node.z === undefined) return;
         const distance = 120;
         const ratio = 1 + distance / Math.hypot(node.x, node.y, node.z);
@@ -99,6 +112,7 @@ function GraphView({ nodes, edges, highlightedNodeIds, highlightedEdgeKeys, onEd
           node as { x: number; y: number; z: number },
           800,
         );
+        onNodeSelect?.(node.id);
       });
 
     graphRef.current = graph;
@@ -135,6 +149,7 @@ function GraphView({ nodes, edges, highlightedNodeIds, highlightedEdgeKeys, onEd
     graph
       .nodeColor((n) => {
         const node = n as GraphNode;
+        if (selectedNodeId && node.id === selectedNodeId) return COLORS.highlight;
         if (highlightedNodeIds.has(node.id)) return COLORS.highlight;
         if (node.type === 'Document') return COLORS.document;
         if (node.type === 'Passage') return COLORS.passage;
@@ -157,12 +172,22 @@ function GraphView({ nodes, edges, highlightedNodeIds, highlightedEdgeKeys, onEd
       );
       return () => window.clearTimeout(timer);
     }
-  }, [highlightedNodeIds, highlightedEdgeKeys, nodes, edges]);
+  }, [highlightedNodeIds, highlightedEdgeKeys, nodes, edges, selectedNodeId]);
 
   return <div className="graph-3d" ref={containerRef} aria-label="Interactive 3D knowledge graph" />;
 }
 
-function AnswerPathGraph({ path, onEdgeSelect }: { path: GraphData; onEdgeSelect: (edge: GraphEdge | null) => void }) {
+function AnswerPathGraph({
+  path,
+  onEdgeSelect,
+  onNodeSelect,
+  selectedNodeId,
+}: {
+  path: GraphData;
+  onEdgeSelect: (edge: GraphEdge | null) => void;
+  onNodeSelect?: (nodeId: string | null) => void;
+  selectedNodeId?: string | null;
+}) {
   const highlightedNodeIds = useMemo(() => new Set(path.nodes.map((node) => node.id)), [path.nodes]);
   const highlightedEdgeKeys = useMemo(() => new Set(path.edges.map(edgeKey)), [path.edges]);
 
@@ -185,7 +210,9 @@ function AnswerPathGraph({ path, onEdgeSelect }: { path: GraphData; onEdgeSelect
         edges={path.edges}
         highlightedNodeIds={highlightedNodeIds}
         highlightedEdgeKeys={highlightedEdgeKeys}
+        selectedNodeId={selectedNodeId}
         onEdgeSelect={onEdgeSelect}
+        onNodeSelect={onNodeSelect}
       />
     </div>
   );
@@ -203,29 +230,36 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [askResult, setAskResult] = useState<AskResponse | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<GraphEdge | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<{ type: 'idle' | 'loading' | 'success' | 'error'; message: string }>({
+    type: 'idle',
+    message: '',
+  });
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const refreshDocumentList = async (preferredDocumentName?: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/graph/summary`);
+    const result = await readJson(response);
+    if (!response.ok) throw new Error(result.detail ?? 'Could not load the document list.');
+
+    const docs = (result.documents ?? []) as DocumentSummary[];
+    setDocuments(docs);
+
+    const requested = preferredDocumentName ?? new URLSearchParams(window.location.search).get('document_name');
+    const nextDocument = requested ?? docs.find((doc) => doc.relationship_count > 0)?.document_name ?? docs[0]?.document_name ?? '';
+    setSelectedDocument(nextDocument);
+    return nextDocument;
+  };
 
   // 1) Find uploaded documents and pick one (?document_name=... wins, else the first with relationships).
   useEffect(() => {
     let cancelled = false;
-    const requested = new URLSearchParams(window.location.search).get('document_name');
-    fetch(`${API_BASE_URL}/api/graph/summary`)
-      .then(async (response) => {
-        const result = await readJson(response);
-        if (!response.ok) throw new Error(result.detail ?? 'Could not load the document list.');
-        return (result.documents ?? []) as DocumentSummary[];
-      })
-      .then((docs) => {
-        if (cancelled) return;
-        setDocuments(docs);
-        setSelectedDocument(
-          requested ?? docs.find((doc) => doc.relationship_count > 0)?.document_name ?? docs[0]?.document_name ?? '',
-        );
-      })
+    refreshDocumentList()
       .catch((error: unknown) => {
         if (cancelled) return;
         setGraphError(error instanceof Error ? error.message : 'Could not load the document list.');
-        if (requested) setSelectedDocument(requested);
       });
     return () => {
       cancelled = true;
@@ -286,12 +320,11 @@ function App() {
     [visibleGraph],
   );
 
-  async function handleAsk(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const submittedQuestion = question.trim();
-    if (!submittedQuestion || isAsking) return;
+  async function askQuestion(submittedQuestion: string) {
+    const trimmedQuestion = submittedQuestion.trim();
+    if (!trimmedQuestion || isAsking) return;
 
-    setMessages((current) => [...current, { role: 'user', content: submittedQuestion }]);
+    setMessages((current) => [...current, { role: 'user', content: trimmedQuestion }]);
     setQuestion('');
     setIsAsking(true);
     setAskResult(null);
@@ -300,7 +333,7 @@ function App() {
       const response = await fetch(`${API_BASE_URL}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: submittedQuestion }),
+        body: JSON.stringify({ question: trimmedQuestion }),
       });
       const result = await readJson(response);
       if (!response.ok) throw new Error(result.detail ?? 'The question could not be answered.');
@@ -325,6 +358,71 @@ function App() {
     }
   }
 
+  async function handleAsk(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const submittedQuestion = question.trim();
+    if (!submittedQuestion) {
+      if (selectedNodeId) {
+        const nodeLabel = visibleGraph?.nodes.find((node) => node.id === selectedNodeId)?.label ?? 'the selected concept';
+        await askQuestion(`Explain the concept "${nodeLabel}" in the context of the current document.`);
+      }
+      return;
+    }
+    await askQuestion(submittedQuestion);
+  }
+
+  async function askAboutSelectedNode() {
+    if (!selectedNodeId) {
+      setUploadStatus({ type: 'error', message: 'Select a concept in the graph before asking about it.' });
+      return;
+    }
+    const nodeLabel = visibleGraph?.nodes.find((node) => node.id === selectedNodeId)?.label ?? 'the selected concept';
+    await askQuestion(`Explain the concept "${nodeLabel}" in the context of the current document and its direct relationships.`);
+  }
+
+  async function handleUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!uploadFile || isUploading) return;
+
+    setIsUploading(true);
+    setUploadStatus({ type: 'loading', message: `Uploading ${uploadFile.name} and generating the knowledge graph…` });
+    setGraphError(null);
+
+    const formData = new FormData();
+    formData.append('file', uploadFile);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/documents/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const result = await readJson(response);
+      if (!response.ok) {
+        throw new Error(result.detail ?? 'The document could not be processed.');
+      }
+
+      const nextDocumentName = uploadFile.name;
+      setUploadStatus({ type: 'success', message: result.message ?? `${nextDocumentName} was processed successfully.` });
+      setSelectedDocument(nextDocumentName);
+      await refreshDocumentList(nextDocumentName);
+      setUploadFile(null);
+      setQuestion('');
+      setMessages((current) => [
+        ...current,
+        {
+          role: 'assistant',
+          content: `The document "${nextDocumentName}" was processed successfully. The graph is ready for questions.`,
+        },
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The document could not be processed.';
+      setGraphError(message);
+      setUploadStatus({ type: 'error', message });
+    } finally {
+      setIsUploading(false);
+    }
+  }
+
   const hasGraph = !!visibleGraph && visibleGraph.nodes.length > 0;
 
   return (
@@ -345,6 +443,33 @@ function App() {
         <p className="intro-copy">Ask about the knowledge graph to get a concise answer and see the connected concepts highlighted below.</p>
       </section>
 
+      <section className="ingest" aria-label="Upload document to build the knowledge graph">
+        <form className="upload-form" onSubmit={handleUpload}>
+          <label className={`file-picker ${uploadFile ? 'has-file' : ''}`}>
+            <input
+              type="file"
+              accept=".pdf,.docx,.txt"
+              onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)}
+            />
+            <span className="upload-glyph" aria-hidden="true">⇪</span>
+            <span className="file-copy">
+              <strong>{uploadFile ? uploadFile.name : 'Choose a PDF, DOCX, or TXT file'}</strong>
+              <small>Upload to generate the knowledge graph automatically</small>
+            </span>
+            <span className="browse-label">Browse</span>
+          </label>
+          <button className="process-button" type="submit" disabled={!uploadFile || isUploading}>
+            {isUploading ? <span className="spinner" /> : <span aria-hidden="true">↗</span>}
+            {isUploading ? 'Processing' : 'Generate graph'}
+          </button>
+        </form>
+        {uploadStatus.message && (
+          <p className={`status ${uploadStatus.type === 'success' ? 'success' : ''}`}>
+            {uploadStatus.message}
+          </p>
+        )}
+      </section>
+
       <section className="chat-panel" aria-label="Ask the knowledge graph">
         <div className="chat-heading">
           <div>
@@ -360,7 +485,12 @@ function App() {
                 <span className="chat-role">{message.role === 'user' ? 'You' : 'Graph assistant'}</span>
                 <p>{message.content}</p>
                 {message.role === 'assistant' && message.answerPath && (
-                  <AnswerPathGraph path={message.answerPath} onEdgeSelect={setSelectedEdge} />
+                  <AnswerPathGraph
+                    path={message.answerPath}
+                    onEdgeSelect={setSelectedEdge}
+                    onNodeSelect={setSelectedNodeId}
+                    selectedNodeId={selectedNodeId}
+                  />
                 )}
                 {message.evidence && message.evidence.length > 0 && (
                   <details className="chat-evidence">
@@ -393,15 +523,21 @@ function App() {
             id="graph-question"
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
-            placeholder="Ask how two concepts are connected…"
+            placeholder={selectedNodeId ? 'Ask about the selected concept or any graph question…' : 'Ask how two concepts are connected…'}
             maxLength={2000}
             disabled={isAsking}
           />
-          <button className="process-button" type="submit" disabled={!question.trim() || isAsking}>
+          <button className="process-button" type="submit" disabled={!question.trim() && !selectedNodeId || isAsking}>
             {isAsking ? <span className="spinner" /> : <span aria-hidden="true">↗</span>}
             Ask
           </button>
         </form>
+        {selectedNodeId && (
+          <div className="selection-detail">
+            <strong>Selected concept:</strong> {visibleGraph?.nodes.find((node) => node.id === selectedNodeId)?.label ?? 'Unknown'}
+            <button type="button" onClick={askAboutSelectedNode} aria-label="Ask about selected concept">Ask selected</button>
+          </div>
+        )}
       </section>
 
       <section className="graph-section" aria-label="Generated graph">
@@ -438,7 +574,9 @@ function App() {
                 edges={visibleGraph.edges}
                 highlightedNodeIds={visibleGraph.highlightedNodeIds}
                 highlightedEdgeKeys={visibleGraph.highlightedEdgeKeys}
+                selectedNodeId={selectedNodeId}
                 onEdgeSelect={setSelectedEdge}
+                onNodeSelect={setSelectedNodeId}
               />
               <p className="graph-hint">Drag to rotate · scroll to zoom · click a connection to see its evidence</p>
             </>
