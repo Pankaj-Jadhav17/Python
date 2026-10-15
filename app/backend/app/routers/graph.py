@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from GraphRAG.db import GraphRAGStore
+from app.services.graph_service import service as graph_service
 
 router = APIRouter()
-service = GraphRAGStore()
+service = graph_service
 
 
 class GraphIngestRequest(BaseModel):
@@ -28,7 +28,7 @@ def ingest_graph(payload: GraphIngestRequest):
 
 @router.get("/summary")
 def get_summary():
-    return {"documents": service.get_graph_summary()}
+    return {"documents": service.get_summary()}
 
 
 @router.get("/graph")

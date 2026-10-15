@@ -1,12 +1,11 @@
 import hashlib
-import os
 from pathlib import Path
 
-from .config import config
+from app.config import config
 from .db import GraphRAGStore
+from .document_loader import extract_document_text
 from .embeddings import embed_texts
 from .extractor import extract_triples
-from .graph_builder import build_graph_data
 from .utils.text_utils import clean_text, chunk_text
 
 
@@ -97,14 +96,8 @@ def ingest_file(file_path: str, *, document_name: str | None = None, store: Grap
     extension = path.suffix.lower()
     if extension in {".txt", ".md"}:
         text = path.read_text(encoding="utf-8", errors="replace")
-    elif extension == ".pdf":
-        from app.services.pdf_graph_service import PDFGraphService
-
-        text = PDFGraphService().extract_text_from_pdf(str(path))
-    elif extension == ".docx":
-        from app.services.pdf_graph_service import PDFGraphService
-
-        text = "\n".join(PDFGraphService().iter_text_chunks(str(path), extension))
+    elif extension in {".pdf", ".docx"}:
+        text = extract_document_text(str(path), extension)
     else:
         raise ValueError(f"Unsupported document type: {extension}")
     if not text or not text.strip():

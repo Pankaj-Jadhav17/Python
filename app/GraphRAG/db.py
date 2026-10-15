@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover
     GraphDatabase = None
 
-from .config import config
+from app.config import config
 
 
 logger = logging.getLogger(__name__)

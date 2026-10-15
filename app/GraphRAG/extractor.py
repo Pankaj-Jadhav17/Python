@@ -1,6 +1,6 @@
 import re
 
-from .config import config
+from app.config import config
 from .llm import generate_structured
 
 ALLOWED_RELATIONS = {

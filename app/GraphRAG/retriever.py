@@ -1,6 +1,6 @@
 import json
 
-from .config import config
+from app.config import config
 from .db import GraphRAGStore
 from .embeddings import cosine_similarity, embed_question
 from .graph_builder import build_graph_data

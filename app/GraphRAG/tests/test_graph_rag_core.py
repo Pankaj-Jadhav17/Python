@@ -2,9 +2,11 @@ import math
 
 import pytest
 
-from GraphRAG.config import GraphRAGConfig
+from app.config import AppConfig
 from GraphRAG.embeddings import validate_embedding_vector
 from GraphRAG.utils.text_utils import clean_text, chunk_text
+
+GraphRAGConfig = AppConfig
 
 
 def test_graph_rag_config_validates_runtime_values():

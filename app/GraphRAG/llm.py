@@ -3,7 +3,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from .config import config
+from app.config import config
 
 
 def _request_json(url: str, payload: dict[str, Any] | None = None, method: str = "POST", timeout: int | None = None) -> dict[str, Any]:

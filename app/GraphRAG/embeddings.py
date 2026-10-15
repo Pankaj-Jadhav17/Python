@@ -1,7 +1,7 @@
 import math
 from collections.abc import Sequence
 
-from .config import config
+from app.config import config
 from .llm import generate_embedding, generate_embeddings
 
 

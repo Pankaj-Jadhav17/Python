@@ -1,6 +1,6 @@
 from collections import OrderedDict
 
-from .config import config
+from app.config import config
 
 
 def build_graph_data(triples: list[dict], *, max_nodes: int | None = None, max_edges: int | None = None) -> dict:

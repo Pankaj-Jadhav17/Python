@@ -4,10 +4,10 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from GraphRAG.ingest import ingest_file
+from app.services.document_service import service as document_service
 
 router = APIRouter()
-service = None
+service = document_service
 
 
 @router.post("/upload")
@@ -36,30 +36,9 @@ async def upload_document(
             temp_file.write(content)
         temp_file.close()
 
-        if service is not None:
-            try:
-                service.check_ollama()
-                passages = list(
-                    service.iter_passages(
-                        temp_file.name,
-                        extension,
-                        file.filename,
-                        start_page=start_page,
-                        end_page=end_page,
-                    )
-                )
-                result = service.create_evidence_graph(file.filename, passages)
-            except RuntimeError as error:
-                raise HTTPException(status_code=503, detail=str(error)) from error
-            except ValueError as error:
-                raise HTTPException(status_code=400, detail=str(error)) from error
-            return {
-                "message": "Document passages and evidence graph ingested successfully.",
-                **result,
-            }
-
         try:
-            result = await run_in_threadpool(ingest_file, temp_file.name, document_name=file.filename)
+            service.check_ollama()
+            result = await run_in_threadpool(service.ingest, temp_file.name, document_name=file.filename)
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except ValueError as error:
