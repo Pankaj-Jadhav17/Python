@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import json
+from typing import Any
 
 from app.config import config
 from .db import GraphRAGStore
-from .embeddings import cosine_similarity, embed_question
+from .embeddings import embed_question
 from .graph_builder import build_graph_data
 from .llm import generate_text
 
@@ -12,13 +15,26 @@ class GraphRAGRetriever:
         self.store = store or GraphRAGStore()
         self.config = config
 
-    def ask(self, question: str) -> dict:
+    def ask(self, question: str, collection_id: str | None = None) -> dict[str, Any]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Question must not be empty.")
+
         question = question.strip()
         question_vector = embed_question(question)
-        passages = self.store.search_similar_passages(question_vector, limit=self.config.vector_retrieval_count)
-        evidence: list[dict] = []
+
+        try:
+            passages = self.store.search_similar_passages(
+                question_vector,
+                limit=self.config.vector_retrieval_count,
+                collection_id=collection_id,
+            )
+        except TypeError:
+            passages = self.store.search_similar_passages(
+                question_vector,
+                limit=self.config.vector_retrieval_count,
+            )
+
+        evidence: list[dict[str, Any]] = []
         for passage in passages:
             evidence.append({
                 "source": passage.get("document_name") or "document",
@@ -32,7 +48,18 @@ class GraphRAGRetriever:
                 "status": "verified",
             })
 
-        expanded = self.store.expand_graph(evidence, depth=self.config.graph_traversal_depth)
+        try:
+            expanded = self.store.expand_graph(
+                evidence,
+                depth=self.config.graph_traversal_depth,
+                collection_id=collection_id,
+            )
+        except TypeError:
+            expanded = self.store.expand_graph(
+                evidence,
+                depth=self.config.graph_traversal_depth,
+            )
+
         flat_graph = build_graph_data([
             {
                 "subject": item.get("source") or item.get("document_name") or "unknown",
@@ -46,7 +73,7 @@ class GraphRAGRetriever:
                 "status": item.get("status", "verified"),
             }
             for item in expanded or evidence
-        ], max_nodes=self.config.max_graph_nodes, max_edges=self.config.max_graph_edges)
+        ], collection_id=collection_id, max_nodes=self.config.max_graph_nodes, max_edges=self.config.max_graph_edges)
 
         if not evidence and not expanded:
             return {
@@ -60,12 +87,14 @@ class GraphRAGRetriever:
             "evidence": evidence + expanded,
             "graph": flat_graph,
         }
+
         answer_text = generate_text(
             f"Answer using only the supplied evidence. If there is insufficient information, say so clearly.\n\n{json.dumps(context, ensure_ascii=False)}",
             system_prompt="You answer questions strictly from retrieved graph evidence. Never invent facts or use external knowledge.",
             model=self.config.ollama_chat_model,
             max_tokens=384,
         )
+
         return {
             "answer": answer_text,
             "path": {"nodes": flat_graph["nodes"], "edges": flat_graph["edges"]},
@@ -73,5 +102,10 @@ class GraphRAGRetriever:
         }
 
 
-def answer_question(question: str, *, store: GraphRAGStore | None = None) -> dict:
-    return GraphRAGRetriever(store=store).ask(question)
+def answer_question(
+    question: str,
+    *,
+    collection_id: str | None = None,
+    store: GraphRAGStore | None = None,
+) -> dict[str, Any]:
+    return GraphRAGRetriever(store=store).ask(question, collection_id=collection_id)

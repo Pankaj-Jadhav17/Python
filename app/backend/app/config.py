@@ -46,6 +46,9 @@ class AppConfig:
     ollama_num_predict: int = _env_int("OLLAMA_NUM_PREDICT", 384)
     ask_concept_similarity_threshold: float = _env_float("ASK_CONCEPT_SIMILARITY_THRESHOLD", 0.35)
     ask_max_concepts: int = _env_int("ASK_MAX_CONCEPTS", 2000)
+    entity_resolution_high_threshold: float = _env_float("ENTITY_RESOLUTION_HIGH_THRESHOLD", 0.88)
+    entity_resolution_medium_threshold: float = _env_float("ENTITY_RESOLUTION_MEDIUM_THRESHOLD", 0.72)
+    enable_community_detection: bool = True
 
     def validate(self) -> "AppConfig":
         if not self.neo4j_uri:

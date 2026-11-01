@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.services.document_service import service as document_service
@@ -13,17 +13,19 @@ service = document_service
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    start_page: int | None = None,
-    end_page: int | None = None,
+    start_page: int | None = Form(None),
+    end_page: int | None = Form(None),
+    collection_id: str | None = Form(None),
+    collection_name: str | None = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="A file name is required.")
 
     extension = Path(file.filename).suffix.lower()
-    if extension not in {".pdf", ".docx", ".txt"}:
+    if extension not in {".pdf", ".docx", ".txt", ".md"}:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Upload a PDF, DOCX, or TXT file.",
+            detail="Unsupported file type. Upload a PDF, DOCX, TXT, or MD file.",
         )
     if extension != ".pdf" and (start_page is not None or end_page is not None):
         raise HTTPException(status_code=400, detail="Page ranges can only be used with PDF files.")
@@ -38,13 +40,24 @@ async def upload_document(
 
         try:
             service.check_ollama()
-            result = await run_in_threadpool(service.ingest, temp_file.name, document_name=file.filename)
+            result = await run_in_threadpool(
+                service.ingest,
+                temp_file.name,
+                document_name=file.filename,
+                collection_id=collection_id,
+                collection_name=collection_name,
+            )
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+
+        msg = (
+            result.get("message")
+            or "Document passages and evidence graph ingested successfully into the collection."
+        )
         return {
-            "message": "Document passages and evidence graph ingested successfully.",
+            "message": msg,
             **result,
         }
     finally:
