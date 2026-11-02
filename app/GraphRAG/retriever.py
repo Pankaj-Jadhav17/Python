@@ -5,14 +5,15 @@ from typing import Any
 
 from app.config import config
 from .db import GraphRAGStore
-from .embeddings import embed_question
+from .graphiti_integration import GraphitiAdapter
 from .graph_builder import build_graph_data
 from .llm import generate_text
 
 
 class GraphRAGRetriever:
     def __init__(self, store: GraphRAGStore | None = None):
-        self.store = store or GraphRAGStore()
+        self.store = store
+        self.adapter = GraphitiAdapter()
         self.config = config
 
     def ask(self, question: str, collection_id: str | None = None) -> dict[str, Any]:
@@ -20,71 +21,28 @@ class GraphRAGRetriever:
             raise ValueError("Question must not be empty.")
 
         question = question.strip()
-        question_vector = embed_question(question)
+        evidence = self.adapter.search(question, collection_id=collection_id, limit=self.config.vector_retrieval_count)
+        flat_graph = {
+            "nodes": [{"id": item["source"], "label": item["source"], "type": "Entity"} for item in evidence]
+            + [{"id": item["target"], "label": item["target"], "type": "Entity"} for item in evidence],
+            "edges": [{
+                "source": item["source"],
+                "target": item["target"],
+                "label": item["relation"],
+                "evidence_records": [{"evidence": item["evidence"]}],
+            } for item in evidence],
+        }
 
-        try:
-            passages = self.store.search_similar_passages(
-                question_vector,
-                limit=self.config.vector_retrieval_count,
-                collection_id=collection_id,
-            )
-        except TypeError:
-            passages = self.store.search_similar_passages(
-                question_vector,
-                limit=self.config.vector_retrieval_count,
-            )
-
-        evidence: list[dict[str, Any]] = []
-        for passage in passages:
-            evidence.append({
-                "source": passage.get("document_name") or "document",
-                "target": passage.get("passage_id") or "passage",
-                "relation": "contains relevant passage",
-                "evidence": passage.get("text"),
-                "page": passage.get("page"),
-                "passageId": passage.get("passage_id"),
-                "documentName": passage.get("document_name"),
-                "confidence": passage.get("score", 0.0),
-                "status": "verified",
-            })
-
-        try:
-            expanded = self.store.expand_graph(
-                evidence,
-                depth=self.config.graph_traversal_depth,
-                collection_id=collection_id,
-            )
-        except TypeError:
-            expanded = self.store.expand_graph(
-                evidence,
-                depth=self.config.graph_traversal_depth,
-            )
-
-        flat_graph = build_graph_data([
-            {
-                "subject": item.get("source") or item.get("document_name") or "unknown",
-                "relation": item.get("relation") or "related to",
-                "object": item.get("target") or item.get("passage_id") or "unknown",
-                "evidence": item.get("evidence") or "",
-                "confidence": item.get("confidence", 0.0),
-                "page": item.get("page"),
-                "passage_id": item.get("passage_id"),
-                "document_name": item.get("document_name"),
-                "status": item.get("status", "verified"),
-            }
-            for item in expanded or evidence
-        ], collection_id=collection_id, max_nodes=self.config.max_graph_nodes, max_edges=self.config.max_graph_edges)
-
-        if not evidence and not expanded:
+        if not evidence:
             return {
-                "answer": "I could not find enough verified evidence in the graph to answer that question.",
+                "answer": "I could not find enough verified evidence in the Graphiti knowledge graph to answer that question.",
                 "path": {"nodes": [], "edges": []},
                 "evidence": [],
             }
 
         context = {
             "question": question,
-            "evidence": evidence + expanded,
+            "evidence": evidence,
             "graph": flat_graph,
         }
 
@@ -98,7 +56,7 @@ class GraphRAGRetriever:
         return {
             "answer": answer_text,
             "path": {"nodes": flat_graph["nodes"], "edges": flat_graph["edges"]},
-            "evidence": evidence + expanded,
+            "evidence": evidence,
         }
 
 

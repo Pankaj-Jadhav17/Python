@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from GraphRAG.db import GraphRAGStore
+from GraphRAG.graphiti_integration import GraphitiAdapter
 
 
 class GraphService:
-    """Service wrapper around the shared GraphRAG graph store."""
+    """Service wrapper around the Graphiti-backed graph store."""
 
-    def __init__(self, store: GraphRAGStore | None = None):
+    def __init__(self, store: GraphitiAdapter | None = None):
         self._store = store
 
     @property
-    def store(self) -> GraphRAGStore:
+    def store(self) -> GraphitiAdapter:
         if self._store is None:
-            self._store = GraphRAGStore()
+            self._store = GraphitiAdapter()
         return self._store
 
     def list_collections(self) -> list[dict[str, Any]]:
@@ -29,7 +29,7 @@ class GraphService:
         return self.store.ensure_collection(collection_id, name=name, description=description)
 
     def get_summary(self) -> list[dict[str, Any]]:
-        return self.store.get_graph_summary()
+        return self.store.get_summary()
 
     def get_graph_data(
         self,
