@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -27,6 +28,10 @@ class FakeGraphiti:
     def search(self, query, *, group_ids=None, num_results=10, **kwargs):
         return []
 
+    def search_(self, query, *, group_ids=None, config=None, **kwargs):
+        self.calls.append({"kind": "search_", "query": query, "group_ids": group_ids, "config": config})
+        return SimpleNamespace(edges=[], nodes=[], episodes=[])
+
 
 def test_graphiti_group_id_is_collection_scoped_and_stable():
     assert normalize_group_id("Sales Team") == "sales_team"
@@ -48,3 +53,15 @@ def test_graphiti_adapter_ingests_chunks_as_grouped_episodes():
     assert fake_graphiti.calls
     assert fake_graphiti.calls[0]["group_id"] == "robotics"
     assert "Three Laws.txt" in fake_graphiti.calls[0]["source_description"]
+
+
+def test_graphiti_adapter_search_uses_search_config_limit():
+    fake_graphiti = FakeGraphiti()
+    adapter = GraphitiAdapter(graphiti=fake_graphiti)
+
+    asyncio.run(adapter.search_async("what is robotics?", collection_id="robotics", limit=7))
+
+    assert fake_graphiti.calls[-1]["kind"] == "search_"
+    assert fake_graphiti.calls[-1]["config"] is not None
+    assert fake_graphiti.calls[-1]["config"].limit == 7
+    assert fake_graphiti.calls[-1]["group_ids"] == ["robotics"]

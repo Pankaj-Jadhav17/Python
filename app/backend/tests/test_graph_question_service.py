@@ -1,3 +1,5 @@
+import asyncio
+
 from GraphRAG.retriever import answer_question
 
 
@@ -30,3 +32,26 @@ def test_retriever_returns_answer_and_evidence(monkeypatch):
     assert result["answer"] == "A microspore develops into a pollen grain."
     assert result["path"]["edges"]
     assert result["evidence"][0]["documentName"] == "biology.pdf"
+
+
+def test_question_service_uses_native_store_for_collection_queries(monkeypatch):
+    class DummyStore:
+        def close(self):
+            pass
+
+    captured = {}
+
+    async def fake_answer_question_async(question, *, collection_id=None, store=None):
+        captured["question"] = question
+        captured["collection_id"] = collection_id
+        captured["store"] = store
+        return {"answer": "ok", "path": {"nodes": [], "edges": []}, "evidence": []}
+
+    monkeypatch.setattr("app.services.question_service.GraphRAGStore", lambda: DummyStore())
+    monkeypatch.setattr("app.services.question_service.answer_question_async", fake_answer_question_async)
+
+    result = asyncio.run(__import__("app.services.question_service", fromlist=["service"]).service.ask_async("What is a cell?", collection_id="cell_biology"))
+
+    assert result["answer"] == "ok"
+    assert captured["collection_id"] == "cell_biology"
+    assert isinstance(captured["store"], DummyStore)

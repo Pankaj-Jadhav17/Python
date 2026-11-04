@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -24,7 +25,9 @@ try:
     from graphiti_core.cross_encoder import OpenAIRerankerClient
     from graphiti_core.embedder import OpenAIEmbedder, OpenAIEmbedderConfig
     from graphiti_core.graphiti import EpisodeType
-    from graphiti_core.llm_client import LLMConfig, OpenAIClient
+    from graphiti_core.llm_client import LLMConfig
+    from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+    from graphiti_core.search.search_config import SearchConfig
 except ImportError:  # pragma: no cover
     Graphiti = None
     OpenAIRerankerClient = None
@@ -32,7 +35,8 @@ except ImportError:  # pragma: no cover
     OpenAIEmbedderConfig = None
     EpisodeType = None
     LLMConfig = None
-    OpenAIClient = None
+    OpenAIGenericClient = None
+    SearchConfig = None
 
 
 def normalize_group_id(value: str | None, *, default: str = "default") -> str:
@@ -45,12 +49,39 @@ def normalize_group_id(value: str | None, *, default: str = "default") -> str:
     return normalized or default
 
 
+_SHARED_GRAPHITI_ADAPTER: GraphitiAdapter | None = None
+
+
 class GraphitiAdapter:
     """Compatibility layer that keeps the app’s contracts while routing graph work through Graphiti."""
 
     def __init__(self, graphiti: Any | None = None):
         self._graphiti = graphiti
         self._neo4j_driver = None
+
+    async def initialize(self) -> None:
+        if self._graphiti is None:
+            self._graphiti = self._build_graphiti()
+        if getattr(self._graphiti, "build_indices_and_constraints", None) is not None:
+            await self._maybe_await(self._graphiti.build_indices_and_constraints())
+
+    async def close(self) -> None:
+        if self._graphiti is not None and hasattr(self._graphiti, "close"):
+            await self._maybe_await(self._graphiti.close())
+        if self._neo4j_driver is not None:
+            try:
+                self._neo4j_driver.close()
+            except Exception:
+                logger.warning("Graphiti Neo4j driver could not be closed cleanly.", exc_info=True)
+            self._neo4j_driver = None
+
+    @staticmethod
+    async def _maybe_await(value: Any) -> Any:
+        if asyncio.iscoroutine(value):
+            return await value
+        if asyncio.isfuture(value):
+            return await value
+        return value
 
     @property
     def graphiti(self) -> Any:
@@ -92,7 +123,7 @@ class GraphitiAdapter:
             embedding_model=config.ollama_embedding_model,
         )
 
-        llm_client = OpenAIClient(config=llm_config)
+        llm_client = OpenAIGenericClient(config=llm_config)
         embedder = OpenAIEmbedder(config=embedder_config)
         reranker = OpenAIRerankerClient(config=llm_config, client=llm_client.client)
 
@@ -243,7 +274,7 @@ class GraphitiAdapter:
         except Exception:
             logger.warning("Graphiti document metadata could not be stored in Neo4j; continuing with the Graphiti episode pipeline only.", exc_info=True)
 
-    def ingest_document_text(
+    async def ingest_document_text_async(
         self,
         document_name: str,
         text: str,
@@ -263,7 +294,11 @@ class GraphitiAdapter:
         self.ensure_collection(collection_id, name=collection_name or collection_id)
 
         content_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
-        existing_doc = self.find_document_by_content_hash(content_hash, collection_id)
+        existing_doc = None
+        if store is not None and hasattr(store, "find_document_by_content_hash"):
+            existing_doc = store.find_document_by_content_hash(content_hash, collection_id=collection_id)
+        if existing_doc is None and (store is None or not hasattr(store, "find_document_by_content_hash")):
+            existing_doc = self.find_document_by_content_hash(content_hash, collection_id)
         if existing_doc:
             logger.info("Document %s already ingested for collection %s; reusing Graphiti episode membership.", document_name, collection_id)
             existing_graph = self.get_graph_data(collection_id=collection_id)
@@ -272,7 +307,7 @@ class GraphitiAdapter:
                 "document_id": existing_doc.get("document_id") or existing_doc.get("id"),
                 "collection_id": collection_id,
                 "reused": True,
-                "message": f"Document '{document_name}' already exists in collection '{collection_id}'. Reusing the existing Graphiti graph.",
+                "message": f"Reused existing graph for '{document_name}' in collection '{collection_id}'.",
                 "passages": 0,
                 "entities": len(existing_graph.get("nodes", [])),
                 "relationships": len(existing_graph.get("edges", [])),
@@ -311,17 +346,19 @@ class GraphitiAdapter:
         for index, chunk in enumerate(chunks):
             passage = passage_rows[index]
             episode_name = f"{document_name}#{index}"
-            self.graphiti.add_episode(
-                name=episode_name,
-                episode_body=chunk,
-                source_description=(
-                    f"Document '{document_name}' in collection '{collection_id}' "
-                    f"(chunk {index + 1}/{len(chunks)}, passage_id={passage['passage_id']}, document_id={doc_id})"
-                ),
-                reference_time=datetime.now(timezone.utc),
-                group_id=collection_id,
-                source=EpisodeType.message,
-                uuid=passage["passage_id"],
+            await self._maybe_await(
+                self.graphiti.add_episode(
+                    name=episode_name,
+                    episode_body=chunk,
+                    source_description=(
+                        f"Document '{document_name}' in collection '{collection_id}' "
+                        f"(chunk {index + 1}/{len(chunks)}, passage_id={passage['passage_id']}, document_id={doc_id})"
+                    ),
+                    reference_time=datetime.now(timezone.utc),
+                    group_id=collection_id,
+                    source=EpisodeType.message,
+                    uuid=passage["passage_id"],
+                )
             )
 
         collection_graph = self.get_graph_data(collection_id=collection_id)
@@ -336,6 +373,38 @@ class GraphitiAdapter:
             "graph": collection_graph,
         }
 
+    def ingest_document_text(
+        self,
+        document_name: str,
+        text: str,
+        *,
+        collection_id: str | None = None,
+        collection_name: str | None = None,
+        document_id: str | None = None,
+        store: GraphRAGStore | None = None,
+    ) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.ingest_document_text_async(
+                    document_name,
+                    text,
+                    collection_id=collection_id,
+                    collection_name=collection_name,
+                    document_id=document_id,
+                    store=store,
+                )
+            )
+        return self.ingest_document_text_async(
+            document_name,
+            text,
+            collection_id=collection_id,
+            collection_name=collection_name,
+            document_id=document_id,
+            store=store,
+        )
+
     def _resolve_node_name(self, uuid: str | None) -> str:
         if not uuid:
             return "unknown"
@@ -345,26 +414,75 @@ class GraphitiAdapter:
                 return str(uuid)
             return record["name"] or (record["labels"][0] if record.get("labels") else str(uuid))
 
-    def search(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    async def search_async(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("Search query must not be empty.")
         group_ids = [normalize_group_id(collection_id)] if collection_id else None
-        search_results = self.graphiti.search(query.strip(), group_ids=group_ids, num_results=limit)
+        search_fn = getattr(self.graphiti, "search_", None) or getattr(self.graphiti, "search", None)
+        if search_fn is None:
+            raise RuntimeError("Graphiti client does not support search operations.")
+
+        if hasattr(self.graphiti, "search_"):
+            if SearchConfig is not None:
+                results = await self._maybe_await(
+                    search_fn(query.strip(), group_ids=group_ids, config=SearchConfig(limit=limit))
+                )
+            else:
+                results = await self._maybe_await(search_fn(query.strip(), group_ids=group_ids))
+            items = getattr(results, "edges", []) or []
+            nodes = {getattr(node, "uuid", None): node for node in getattr(results, "nodes", []) or []}
+            episodes = {getattr(episode, "uuid", None): episode for episode in getattr(results, "episodes", []) or []}
+        else:
+            results = await self._maybe_await(search_fn(query.strip(), group_ids=group_ids, num_results=limit))
+            items = results or []
+            nodes = {}
+            episodes = {}
+
         edges: list[dict[str, Any]] = []
-        for item in search_results:
-            source_name = self._resolve_node_name(getattr(item, "source_node_uuid", None))
-            target_name = self._resolve_node_name(getattr(item, "target_node_uuid", None))
+        for item in items:
+            source_uuid = getattr(item, "source_node_uuid", None)
+            target_uuid = getattr(item, "target_node_uuid", None)
+            source_name = self._resolve_node_name(source_uuid)
+            target_name = self._resolve_node_name(target_uuid)
+            evidence_text = getattr(item, "fact", "") or getattr(item, "summary", "") or ""
+            episode_uuid = None
+            if getattr(item, "episodes", None):
+                episode_uuid = item.episodes[0] if isinstance(item.episodes, list) else item.episodes
+            episode_record = episodes.get(episode_uuid) if episode_uuid else None
+            document_name = ""
+            passage_id = ""
+            page = None
+            if episode_record is not None:
+                document_name = getattr(episode_record, "source_description", "") or ""
+                passage_id = getattr(episode_record, "uuid", "") or ""
+                if not passage_id and getattr(episode_record, "episode_metadata", None):
+                    passage_id = str(episode_record.episode_metadata.get("passage_id", ""))
+            if not document_name:
+                document_name = getattr(item, "document_name", "") or ""
+            if not passage_id:
+                passage_id = getattr(item, "passage_id", "") or ""
+            if page is None:
+                page = getattr(item, "page", None)
             edges.append({
                 "source": source_name,
                 "target": target_name,
                 "relation": getattr(item, "name", "related_to"),
-                "evidence": getattr(item, "fact", "") or getattr(item, "summary", ""),
-                "confidence": 0.85,
-                "status": "verified",
-                "documentName": "",
-                "passageId": "",
+                "evidence": evidence_text,
+                "confidence": getattr(item, "confidence", None) or 0.0,
+                "status": "unknown",
+                "documentName": document_name,
+                "passageId": passage_id,
+                "page": page,
+                "collection_id": getattr(item, "group_id", None) or collection_id,
             })
         return edges
+
+    def search(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.search_async(query, collection_id=collection_id, limit=limit))
+        return self.search_async(query, collection_id=collection_id, limit=limit)
 
     def get_graph_data(
         self,
@@ -447,3 +565,10 @@ class GraphitiAdapter:
 
 
 adapter = GraphitiAdapter()
+
+
+def get_shared_graphiti_adapter() -> GraphitiAdapter:
+    global _SHARED_GRAPHITI_ADAPTER
+    if _SHARED_GRAPHITI_ADAPTER is None:
+        _SHARED_GRAPHITI_ADAPTER = GraphitiAdapter()
+    return _SHARED_GRAPHITI_ADAPTER

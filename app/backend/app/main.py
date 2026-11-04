@@ -1,15 +1,29 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
+from GraphRAG.graphiti_integration import get_shared_graphiti_adapter
 from app.config import CORS_ORIGINS
 from app.routers.ask import router as ask_router
 from app.routers.documents import router as documents_router
 from app.routers.graph import router as graph_router
 
-app = FastAPI(title="Document Knowledge Graph API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    adapter = get_shared_graphiti_adapter()
+    try:
+        await adapter.initialize()
+        app.state.graphiti_adapter = adapter
+        yield
+    finally:
+        await adapter.close()
+
+
+app = FastAPI(title="Document Knowledge Graph API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

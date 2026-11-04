@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from GraphRAG.graphiti_integration import GraphitiAdapter
+from GraphRAG.graphiti_integration import GraphitiAdapter, get_shared_graphiti_adapter
 
 
 class GraphService:
@@ -14,7 +14,7 @@ class GraphService:
     @property
     def store(self) -> GraphitiAdapter:
         if self._store is None:
-            self._store = GraphitiAdapter()
+            self._store = get_shared_graphiti_adapter()
         return self._store
 
     def list_collections(self) -> list[dict[str, Any]]:

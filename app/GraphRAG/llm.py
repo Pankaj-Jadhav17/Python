@@ -6,6 +6,17 @@ from typing import Any
 from app.config import config
 
 
+def _normalize_ollama_model_name(model_name: str | None) -> str | None:
+    if not model_name:
+        return None
+    name = str(model_name).strip()
+    if not name:
+        return None
+    if ":" in name and "/" not in name:
+        return name.split(":", 1)[0]
+    return name
+
+
 def _request_json(url: str, payload: dict[str, Any] | None = None, method: str = "POST", timeout: int | None = None) -> dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -43,7 +54,10 @@ def list_available_models() -> list[str]:
 def check_model_available(model_name: str | None = None) -> str:
     model = model_name or config.ollama_chat_model
     available = list_available_models()
-    if model not in available:
+    available_aliases = {name for name in available}
+    for name in available:
+        available_aliases.add(_normalize_ollama_model_name(name) or name)
+    if model not in available_aliases:
         raise RuntimeError(f"Ollama model '{model}' is not installed. Run: ollama pull {model}")
     return model
 
