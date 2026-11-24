@@ -1,0 +1,689 @@
+================================================================================
+GRAPHROOM: MULTI-DOCUMENT GRAPHRAG KNOWLEDGE GRAPH APPLICATION
+COMPLETE TECHNICAL DOCUMENTATION & RECENT UPDATES SPECIFICATION
+================================================================================
+
+Document Revision: 2.1
+Last Updated: November 2026
+System Name: Graphroom (Multi-Document GraphRAG System)
+Core Frameworks: Graphiti-Core, FastAPI, Neo4j, Ollama, React + Vite (3D Force Graph)
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & SYSTEM PURPOSE
+2. SYSTEM ARCHITECTURE & COMPONENT TOPOLOGY
+3. IN-DEPTH ANALYSIS OF LAST INFORMATION ADDED & RECENT UPDATES
+   3.1 Graphiti-Core Integration & Hybrid Search Architecture
+   3.2 Multi-Document Subject Collections & Isolation
+   3.3 Cross-Document Canonical Entity Resolution
+   3.4 Enhanced Document Ingestion (PDF Page Ranges, Multi-Format, Idempotency)
+   3.5 Grounded Question Answering Engine & Anti-Hallucination Guardrails
+   3.6 Interactive 3D Force Graph UI & Visual Answer Paths
+   3.7 Backend Service Layer Refactoring
+4. COMPLETE API SPECIFICATION & DATA CONTRACTS
+5. NEO4J GRAPH DATA MODEL & ONTOLOGY
+6. CONFIGURATION & ENVIRONMENT VARIABLES
+7. TEST SUITE & VERIFICATION COVERAGE (40 TESTS)
+8. DEPLOYMENT, OPERATIONAL RUNBOOK & TROUBLESHOOTING
+
+================================================================================
+1. EXECUTIVE SUMMARY & SYSTEM PURPOSE
+================================================================================
+Graphroom is a state-of-the-art Knowledge Graph system designed to bridge the
+critical gaps of traditional vector-only Retrieval-Augmented Generation (RAG).
+While conventional RAG systems rely on flat text chunk embeddings that suffer from
+context fragmentation, inability to traverse multi-hop relationships, and high
+hallucination rates, Graphroom implements a unified GraphRAG paradigm:
+
+1. Ingestion: Documents (PDF, DOCX, TXT, Markdown) are ingested into dedicated
+   Subject Collections, chunked with semantic overlap, and enriched with provenance
+   metadata (page numbers, chunk indices, character offsets, content hashes).
+2. Knowledge Graph Construction: Concepts, entities, and typed relationships are
+   extracted and stored in Neo4j via Graphiti-core episodes and Cypher nodes.
+3. Cross-Document Canonical Entity Resolution: Entities mentioned across different
+   documents within the same collection automatically resolve to shared canonical
+   nodes through a 5-stage disambiguation pipeline, preserving provenance and
+   contrasting claims.
+4. Hybrid Search with Reciprocal Rank Fusion (RRF): Answers are retrieved using
+   four search dimensions simultaneously: Graph Edges, Graph Nodes, Episodic Passages,
+   and Topic Communities, reranked via cross-encoders.
+5. Grounded Synthesis: Local LLMs (Ollama llama3.2) generate answers strictly citing
+   retrieved passages and graph relationships, providing verifiable, evidence-backed
+   explanations with visual 3D answer graphs.
+
+================================================================================
+2. SYSTEM ARCHITECTURE & COMPONENT TOPOLOGY
+================================================================================
+The application is structured into four primary tiers:
+
+[Client Tier: React + Vite + 3D-Force-Graph]
+  ├── Interactive 3D Force Graph canvas powered by Three.js (WebGL)
+  ├── Subject Collection switcher and collection creation modal
+  ├── Multi-document file uploader with collection assignment and page ranges
+  ├── Conversational Q&A chat panel with embedded per-response 3D answer graphs
+  └── Evidence inspection drawer with exact source passage quotes and confidence
+
+[API & Service Tier: FastAPI 0.141+ on Python 3.12]
+  ├── Lifespan Context Manager: Asynchronously initializes and shuts down GraphitiAdapter
+  ├── Routers:
+  │   ├── app/routers/documents.py (file uploads, validation, temp file streaming)
+  │   ├── app/routers/graph.py (collections CRUD, graph queries, summaries, ingest)
+  │   └── app/routers/ask.py (collection-scoped natural language Q&A)
+  └── Services:
+      ├── app/services/document_service.py (Ollama pre-flight check, async ingestion)
+      ├── app/services/graph_service.py (Neo4j metadata, summary, collection stats)
+      └── app/services/question_service.py (async hybrid retrieval & answer pipeline)
+
+[Knowledge Graph Engine Tier: GraphRAG & Graphiti-Core 0.31+]
+  ├── GraphitiAdapter: Bridges FastAPI contracts with Graphiti episodic engine
+  ├── Entity Resolution Engine: 5-stage disambiguation & domain synonym matching
+  ├── Hybrid Retriever: Reciprocal Rank Fusion (RRF) & cross-encoder reranker
+  └── Extractor & Document Loader: PyMuPDF, python-docx, text chunkers
+
+[Data & Inference Tier: Neo4j 5.x & Ollama]
+  ├── Neo4j: Stores Collections, Documents, Passages, Canonical Entities, Edges, Communities
+  └── Ollama: Local inference for chat (llama3.2) and vector embeddings (embeddinggemma)
+
+================================================================================
+3. IN-DEPTH ANALYSIS OF LAST INFORMATION ADDED & RECENT UPDATES
+================================================================================
+The following subsections detail every major feature, architecture update, and
+code change recently implemented in the codebase:
+
+--------------------------------------------------------------------------------
+3.1 GRAPHITI-CORE INTEGRATION & HYBRID SEARCH ARCHITECTURE
+--------------------------------------------------------------------------------
+File: GraphRAG/graphiti_integration.py (~800 lines)
+
+The application introduced deep integration with `graphiti-core` (v0.31+),
+transitioning from single-document manual graphs to an episodic, multi-layer
+temporal knowledge graph engine:
+
+- Shared Graphiti Adapter (`GraphitiAdapter`):
+  Acts as a compatibility layer ensuring that the existing frontend and API contracts
+  remain fully satisfied while routing graph creation, entity storage, and search
+  through Graphiti.
+- Asynchronous Lifespan Management:
+  In `backend/app/main.py`, FastAPI's `@asynccontextmanager lifespan(app)` awaits
+  `adapter.initialize()` at startup to build indices and constraints in Neo4j,
+  and safely executes `adapter.close()` on application teardown.
+- Episodic Ingestion Pipeline:
+  When a document is ingested, chunks are registered as episodes via
+  `graphiti.add_episode()` with:
+  • `name`: `${document_name}#${chunk_index}`
+  • `episode_body`: the cleaned text chunk
+  • `source_description`: metadata detailing document name, collection, chunk index,
+    and passage ID
+  • `group_id`: normalized collection identifier
+  • `source`: `EpisodeType.message`
+  • `uuid`: passage hash identifier
+- Combined Hybrid Search with Reciprocal Rank Fusion (RRF):
+  The search engine activates `COMBINED_HYBRID_SEARCH_RRF` across four dimensions:
+  1. Edge Config: Ranks semantic relationships and facts between entities.
+  2. Node Config: Ranks relevant entities and their attributes.
+  3. Episode Config: Ranks supporting raw text passages.
+  4. Community Config: Ranks broad topic and community summaries.
+  Results are reranked using `OpenAIRerankerClient` pointing to the local Ollama
+  instance, producing a unified relevance ranking.
+- Passage Provenance Mapping:
+  `get_passages_by_ids()` executes a batch-retrieval Cypher query over Neo4j to
+  fetch `Passage` nodes and link them to their parent `Document` records, ensuring
+  every edge and episode in the final result carries exact document names, page
+  numbers, and chunk offsets.
+- Dual-Path Architecture:
+  If an explicit `GraphRAGStore` is injected (e.g. during specialized unit tests or
+  isolated legacy pipelines), `GraphRAGRetriever` gracefully routes execution through
+  the custom store, ensuring 100% backward compatibility.
+
+--------------------------------------------------------------------------------
+3.2 MULTI-DOCUMENT SUBJECT COLLECTIONS & ISOLATION
+--------------------------------------------------------------------------------
+Files:
+  - backend/app/routers/graph.py
+  - backend/app/services/graph_service.py
+  - GraphRAG/graphiti_integration.py
+  - frontend/App.tsx
+
+Previously, documents were ingested into a single global namespace. The new update
+implements Subject Collections:
+
+- Normalized Group Identifiers:
+  The function `normalize_group_id(value)` sanitizes user-provided collection names
+  into URL-safe, lowercase alphanumeric strings with underscores (e.g., "Cell Biology 101"
+  becomes "cell_biology_101").
+- Collection Node Persistence in Neo4j:
+  Each collection is tracked with a dedicated `:Collection` node:
+    MERGE (c:Collection {id: $collection_id})
+    ON CREATE SET c.name = $name, c.description = $description, c.created_at = timestamp
+    ON MATCH SET c.updated_at = timestamp
+- Multi-Document Graph Linking:
+  Inside Neo4j, documents belong to collections via `(c:Collection)-[:HAS_DOCUMENT]->(d:Document)`.
+  Passages belong to documents via `(d:Document)-[:HAS_PASSAGE]->(p:Passage)`.
+  Multiple documents uploaded into the same collection merge their entity graphs,
+  allowing cross-document multi-hop queries within the collection.
+- Scoped Retrieval:
+  Endpoints `/api/graph/graph?collection_id=...` and `/ask` with `{"collection_id": "..."}`
+  filter queries strictly to the target collection, preventing irrelevant cross-domain
+  data leakage between distinct collections.
+
+--------------------------------------------------------------------------------
+3.3 CROSS-DOCUMENT CANONICAL ENTITY RESOLUTION
+--------------------------------------------------------------------------------
+File: GraphRAG/entity_resolution.py (411 lines)
+
+When documents within the same collection discuss common concepts, they often use
+different surface names or abbreviations (e.g., "ATP", "adenosine triphosphate",
+"ATP molecule"). The new Entity Resolution Engine ensures that:
+
+- Entity Mention vs Canonical Entity:
+  Mentions (`EntityMention`) capture local surface occurrences in specific passages.
+  Canonical entities (`CanonicalEntity`) represent unique, deduplicated nodes.
+- 5-Stage Matching Pipeline:
+  Stage 1: Exact Normalized Matching
+    Using `normalize_entity_name()`, surface strings undergo Unicode NFKC normalization,
+    whitespace collapsing, outer punctuation stripping, and lowercasing.
+  Stage 2: Domain Synonym Groups
+    A bidirectional synonym lookup table (`SYNONYM_GROUPS` / `KNOWN_SYNONYMS`) matches
+    known biology, chemical, and medical terms (e.g., "dna" ↔ "deoxyribonucleic acid",
+    "mitochondria" ↔ "chondriosome", "microspore" ↔ "pollen grain").
+  Stage 3: Token-Level Jaccard Lexical Similarity
+    Calculates word-level overlap between mention tokens.
+  Stage 4: Contrastive Identifier & Numeral Penalization
+    The system identifies distinct numbers, Roman numerals, or single-letter suffixes
+    (e.g., "I" vs "II", "1" vs "2", "Alpha" vs "Beta"). If identifiers differ (such as
+    "RNA polymerase I" vs "RNA polymerase II"), the similarity is immediately clamped
+    to 0.0, strictly preventing disastrous false merges of distinct biological entities.
+  Stage 5: Contextual Semantic Embedding Similarity
+    Generates reference text using `build_entity_reference_text(name, type, context)`
+    and calculates cosine similarity against existing canonical entities using
+    `ENTITY_RESOLUTION_HIGH_THRESHOLD` (0.88) and `MEDIUM_THRESHOLD` (0.72).
+- Preservation of Conflicting Claims:
+  If Document A states "Compound X inhibits Protein Y" while Document B states
+  "Compound X activates Protein Y", both edges are preserved with distinct evidence
+  records and document provenance, rather than overwriting or discarding either fact.
+
+--------------------------------------------------------------------------------
+3.4 ENHANCED DOCUMENT INGESTION PIPELINE
+--------------------------------------------------------------------------------
+Files:
+  - backend/app/routers/documents.py
+  - backend/app/services/document_service.py
+  - GraphRAG/document_loader.py
+  - GraphRAG/ingest.py
+
+Key ingestion improvements include:
+
+- Multi-Format Document Support:
+  Ingestion natively accepts `.pdf`, `.docx`, `.txt`, and `.md` (Markdown) files.
+  • PDF: Extracted using `pymupdf` (fitz) with text sorting.
+  • DOCX: Extracted paragraph-by-paragraph using `python-docx`.
+  • TXT/MD: Read with sliding-window chunk overlap and encoding fallback.
+- PDF Page Range Slicing:
+  Users can upload specific chapters or excerpts using `start_page` and `end_page`
+  form fields. The backend validates page boundaries against the document page count.
+- Content Hashing & Idempotency:
+  The full cleaned text of each document is hashed using SHA-256 (`content_hash`).
+  Before executing expensive LLM extraction and Graphiti embedding, the system checks
+  if the hash already exists within the target collection:
+  • If found: Reuses existing graph data and returns `{"reused": true, "message": "Reused existing graph..."}`.
+  • If not found: Generates chunk rows, stores `:Document` and `:Passage` nodes in Neo4j,
+    and runs Graphiti episode ingestion.
+- Asynchronous File Streaming:
+  Files are streamed to temporary storage via chunks of 1MB and processed asynchronously
+  using Starlette's `run_in_threadpool`, preventing blocking of other API requests.
+
+--------------------------------------------------------------------------------
+3.5 GROUNDED QUESTION ANSWERING & ANTI-HALLUCINATION GUARDRAILS
+--------------------------------------------------------------------------------
+Files:
+  - GraphRAG/retriever.py
+  - backend/app/services/question_service.py
+  - backend/app/routers/ask.py
+
+The Q&A pipeline has been overhauled to eliminate hallucinations and produce
+verifiable, explainable answers:
+
+- Multi-Tier Prompt Assembly:
+  The prompt fed to Ollama is structured into distinct, prioritized sections:
+  1. `--- RETRIEVED SOURCE PASSAGES ---`: Original raw text chunks with explicit
+     document name, page number, and chunk index tags.
+  2. `--- GRAPH RELATIONSHIPS ---`: Extracted subject-predicate-object triples with
+     supporting evidence facts.
+  3. `--- TOPIC COMMUNITIES ---`: High-level thematic summaries from community detection.
+- Strict System Prompt & Guardrails:
+  System Prompt: "You answer questions strictly from retrieved graph evidence and
+  document passages. Never invent facts or use external knowledge. Always cite
+  source documents."
+  Instruction Rule: "If the provided evidence does not contain sufficient information
+  to answer the question, clearly state that there is insufficient evidence in the
+  knowledge graph. Do not extrapolate, assume, or invent facts outside the retrieved
+  evidence."
+- Rich Response Structure:
+  The response returns:
+  • `answer`: The final grounded text with inline source citations.
+  • `path`: Subgraph of `{ nodes: [...], edges: [...] }` representing the exact reasoning
+    chain supporting the answer.
+  • `evidence`: Comprehensive list of passage objects including `document_name`, `page`,
+    `chunk_index`, `text`, and `confidence`.
+  • `nodes`: Entities involved in the answer.
+  • `communities`: High-level topic communities associated with the query.
+
+--------------------------------------------------------------------------------
+3.6 INTERACTIVE 3D FORCE GRAPH UI & VISUAL ANSWER PATHS
+--------------------------------------------------------------------------------
+Files:
+  - frontend/App.tsx (1007 lines)
+  - frontend/App.css (644 lines)
+
+The frontend was completely reimagined under the title "Graphroom · Multi-Document GraphRAG":
+
+- 3D Force Graph Engine:
+  Built with `3d-force-graph` and Three.js, rendering in WebGL at 60 FPS:
+  • Camera Animation: Clicking a node smoothly moves the 3D camera to focus on it.
+  • Semantic Color Coding: Nodes are colored by entity type:
+    - BiologicalEntity (#2e7d32), ChemicalEntity (#00838f), Process (#6a1b9a),
+      Organization (#283593), Person (#ad1457), Location (#ef6c00), Method (#4e342e),
+      Document (#195d4b), Passage (#e9b85f), Concept (#8bc34a).
+  • Community Palette: Alternating color spectrum for detected topic communities.
+  • Directional Particles: Animated particles flow along edges in the answer path,
+    visually indicating reasoning flow.
+- Graph Pruning for Scalability:
+  When a graph exceeds 240 nodes (`LARGE_GRAPH_THRESHOLD`), the UI executes degree-based
+  ranking, retaining the top 180 highest-degree hub nodes and their immediate neighbors,
+  plus all answer path nodes, preventing WebGL frame drops on large multi-document graphs.
+- Subject Collection Management:
+  A dedicated toolbar allows users to switch between collections, inspect document
+  and relationship counts, and create new collections on the fly.
+- Interactive Answer Graph & Evidence Drawer:
+  Each chat response renders an embedded mini 3D Answer Graph displaying only the
+  concepts and links that formed the answer. Clicking any edge or evidence badge
+  opens the evidence inspection drawer displaying exact verbatim source passages.
+- Quick Concept Exploration:
+  Clicking a node automatically populates the question prompt with:
+  "Explain the concept [Node Label] in the context of collection [Active Collection]."
+
+--------------------------------------------------------------------------------
+3.7 BACKEND SERVICE LAYER REFACTORING
+--------------------------------------------------------------------------------
+The backend services were cleanly separated into single-responsibility modules:
+
+- `app/services/document_service.py`:
+  Validates Ollama chat and embedding models; exposes `ingest_async()` and `ingest()`.
+- `app/services/graph_service.py`:
+  Interacts with `GraphitiAdapter` and Neo4j for collections, document summaries,
+  and graph structure filtering.
+- `app/services/question_service.py`:
+  Coordinates the `GraphRAGRetriever` and `GraphitiAdapter` for asynchronous
+  query processing and answer generation.
+
+================================================================================
+4. COMPLETE API SPECIFICATION & DATA CONTRACTS
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1 GET /
+--------------------------------------------------------------------------------
+Description: Health check endpoint.
+Response:
+  {
+    "status": "running"
+  }
+
+--------------------------------------------------------------------------------
+4.2 GET /graph-view
+--------------------------------------------------------------------------------
+Description: Redirects to the 3D React application.
+Query Parameters:
+  - `document_name` (optional): Pre-select a document.
+Status Code: 307 Temporary Redirect (redirects to http://localhost:5173).
+
+--------------------------------------------------------------------------------
+4.3 POST /api/documents/upload
+--------------------------------------------------------------------------------
+Description: Ingests an uploaded document into a collection.
+Content-Type: multipart/form-data
+Form Parameters:
+  - `file`: UploadFile (required) - .pdf, .docx, .txt, or .md
+  - `collection_id`: string (optional) - Target collection ID (default: "default")
+  - `collection_name`: string (optional) - Human-readable name
+  - `start_page`: int (optional, PDF only) - Starting page number (>= 1)
+  - `end_page`: int (optional, PDF only) - Ending page number (>= 1)
+Response (200 OK):
+  {
+    "message": "Document passages and evidence graph ingested successfully into the collection.",
+    "document_name": "botany_chapter_1.pdf",
+    "document_id": "a1b2c3d4e5f6...",
+    "collection_id": "biology",
+    "reused": false,
+    "passages": 14,
+    "entities": 48,
+    "relationships": 72,
+    "graph": {
+      "nodes": [{"id": "microspore", "label": "Microspore", "type": "BiologicalEntity"}],
+      "edges": [{"source": "microspore", "target": "pollen_grain", "label": "develops_into"}]
+    }
+  }
+
+--------------------------------------------------------------------------------
+4.4 GET /api/graph/collections
+--------------------------------------------------------------------------------
+Description: Lists all subject collections.
+Response (200 OK):
+  {
+    "collections": [
+      {
+        "id": "biology",
+        "name": "Cell Biology",
+        "description": "Plant and animal cell biology textbooks"
+      },
+      {
+        "id": "default",
+        "name": "default",
+        "description": ""
+      }
+    ]
+  }
+
+--------------------------------------------------------------------------------
+4.5 POST /api/graph/collections
+--------------------------------------------------------------------------------
+Description: Creates a new subject collection.
+Content-Type: application/json
+Request Body:
+  {
+    "name": "Machine Learning",
+    "collection_id": "ml_research",
+    "description": "Deep learning and GraphRAG papers"
+  }
+Response (200 OK):
+  {
+    "message": "Collection 'Machine Learning' created successfully.",
+    "id": "ml_research",
+    "name": "Machine Learning",
+    "description": "Deep learning and GraphRAG papers"
+  }
+
+--------------------------------------------------------------------------------
+4.6 POST /api/graph/ingest
+--------------------------------------------------------------------------------
+Description: Ingests raw text directly into a collection.
+Content-Type: application/json
+Request Body:
+  {
+    "document_name": "lecture_notes.txt",
+    "text": "Ribosomes are macromolecular machines found within all cells...",
+    "collection_id": "biology",
+    "collection_name": "Cell Biology"
+  }
+Response (200 OK):
+  {
+    "message": "Evidence graph created from text successfully.",
+    "document_name": "lecture_notes.txt",
+    "document_id": "...",
+    "collection_id": "biology",
+    "reused": false,
+    "passages": 2,
+    "entities": 8,
+    "relationships": 12,
+    "graph": { ... }
+  }
+
+--------------------------------------------------------------------------------
+4.7 GET /api/graph/summary
+--------------------------------------------------------------------------------
+Description: Returns document summaries and collections.
+Response (200 OK):
+  {
+    "documents": [
+      {
+        "document_id": "doc-01",
+        "document_name": "botany_chapter_1.pdf",
+        "collection_id": "biology",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "revision": 1
+      }
+    ],
+    "collections": [
+      {
+        "id": "biology",
+        "name": "Cell Biology",
+        "description": "Textbooks"
+      }
+    ]
+  }
+
+--------------------------------------------------------------------------------
+4.8 GET /api/graph/graph
+--------------------------------------------------------------------------------
+Description: Queries the knowledge graph nodes and edges.
+Query Parameters:
+  - `collection_id` (optional): Filter to a specific collection.
+  - `document_name` (optional): Filter to a specific document.
+  - `community_id` (optional): Filter to a specific topic community ID.
+Response (200 OK):
+  {
+    "nodes": [
+      {
+        "id": "node-1",
+        "label": "Mitochondria",
+        "type": "BiologicalEntity",
+        "documents": ["botany_chapter_1.pdf"],
+        "collection_id": "biology"
+      }
+    ],
+    "edges": [
+      {
+        "id": "node-1->node-2:PRODUCES",
+        "source": "node-1",
+        "target": "node-2",
+        "label": "PRODUCES",
+        "evidence_records": [
+          {
+            "evidence": "Mitochondria generate ATP through oxidative phosphorylation.",
+            "document_name": "botany_chapter_1.pdf",
+            "page": 5
+          }
+        ],
+        "document_names": ["botany_chapter_1.pdf"],
+        "passage_ids": ["passage-12"]
+      }
+    ]
+  }
+
+--------------------------------------------------------------------------------
+4.9 POST /ask
+--------------------------------------------------------------------------------
+Description: Answers natural language questions grounded in graph evidence.
+Content-Type: application/json
+Request Body:
+  {
+    "question": "How are microspores connected to pollen grains?",
+    "collection_id": "biology"
+  }
+Response (200 OK):
+  {
+    "answer": "Microspores develop directly into pollen grains, representing the immature male gametophyte stage in seed plants. According to botany_chapter_1.pdf (Page 12), the microspore undergoes mitosis to form generative and vegetative cells within the pollen grain wall.",
+    "path": {
+      "nodes": [
+        {"id": "microspore", "label": "Microspore", "type": "BiologicalEntity"},
+        {"id": "pollen_grain", "label": "Pollen Grain", "type": "BiologicalEntity"}
+      ],
+      "edges": [
+        {
+          "source": "microspore",
+          "target": "pollen_grain",
+          "label": "develops_into",
+          "evidence": "Each haploid microspore matures into an individual pollen grain.",
+          "evidence_records": [
+            {
+              "evidence": "Each haploid microspore matures into an individual pollen grain.",
+              "document_name": "botany_chapter_1.pdf",
+              "page": 12
+            }
+          ]
+        }
+      ]
+    },
+    "evidence": [
+      {
+        "passage_id": "p-1234",
+        "document_name": "botany_chapter_1.pdf",
+        "page": 12,
+        "chunk_index": 3,
+        "text": "Inside the microsporangium, diploid microsporocytes undergo meiosis, yielding four haploid microspores. Each microspore subsequently develops into a pollen grain.",
+        "confidence": 0.96
+      }
+    ],
+    "nodes": [...],
+    "communities": [...]
+  }
+
+================================================================================
+5. NEO4J GRAPH DATA MODEL & ONTOLOGY
+================================================================================
+Neo4j persists the following entity types and relationships:
+
+Nodes:
+- `:Collection`:
+  Properties: `id` (string, unique), `name` (string), `description` (string),
+  `created_at` (epoch timestamp), `updated_at` (epoch timestamp).
+- `:Document`:
+  Properties: `id` (string, unique), `document_name` (string), `collection_id` (string),
+  `content_hash` (string SHA-256), `revision` (integer), `created_at` (epoch timestamp).
+- `:Passage`:
+  Properties: `id` (string, unique), `document_id` (string), `document_name` (string),
+  `collection_id` (string), `chunk_index` (integer), `page` (integer or null),
+  `text` (string), `content_hash` (string), `start_offset` (integer), `end_offset` (integer).
+- `:Entity` / `:Concept` (also labeled by semantic type, e.g. `:BiologicalEntity`):
+  Properties: `id` (string), `uuid` (string), `name` (string), `summary` (string),
+  `group_id` / `collection_id` (string), `aliases` (list of strings).
+- `:Community`:
+  Properties: `id` (string), `name` (string), `summary` (string), `group_id` (string).
+
+Relationships:
+- `(:Collection)-[:HAS_DOCUMENT]->(:Document)`
+- `(:Document)-[:HAS_PASSAGE]->(:Passage)`
+- `(:Entity)-[:RELATES {fact: string, name: string, confidence: float, episodes: [string]}]->(:Entity)`
+- `(:Entity)-[:IN_COMMUNITY]->(:Community)`
+
+================================================================================
+6. CONFIGURATION & ENVIRONMENT VARIABLES
+================================================================================
+The application is configured via environment variables (or `.env` file):
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `NEO4J_URI` | `bolt://127.0.0.1:7687` | Bolt URI for Neo4j database |
+| `NEO4J_USER` | `neo4j` | Database username |
+| `NEO4J_PASSWORD` | `neo4j` | Database password |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | URL to local Ollama server |
+| `OLLAMA_MODEL` | `llama3.2` | Local LLM for reasoning & chat |
+| `OLLAMA_EMBEDDING_MODEL` | `embeddinggemma` | Embedding model for vector indexing |
+| `OLLAMA_TIMEOUT_SECONDS`| `180` | HTTP request timeout for Ollama calls |
+| `OLLAMA_NUM_PREDICT` | `384` | Maximum tokens for Ollama responses |
+| `OLLAMA_CONFIDENCE_THRESHOLD` | `0.72` | Minimum extraction confidence |
+| `GRAPHRAG_CHUNK_SIZE` | `1800` | Text chunk character size |
+| `GRAPHRAG_CHUNK_OVERLAP` | `180` | Overlap between consecutive chunks |
+| `GRAPHRAG_VECTOR_RETRIEVAL_COUNT` | `8` | Top-k vectors retrieved during search |
+| `GRAPHRAG_GRAPH_TRAVERSAL_DEPTH` | `2` | Hop depth for graph neighborhood expansion |
+| `GRAPHRAG_MAX_GRAPH_NODES` | `80` | Cap on nodes returned in subgraphs |
+| `GRAPHRAG_MAX_GRAPH_EDGES` | `120` | Cap on edges returned in subgraphs |
+| `ENTITY_RESOLUTION_HIGH_THRESHOLD` | `0.88` | High confidence entity merge cutoff |
+| `ENTITY_RESOLUTION_MEDIUM_THRESHOLD` | `0.72` | Medium confidence entity merge cutoff |
+| `CORS_ORIGINS` | `http://localhost:5173` | Allowed CORS origins for FastAPI |
+
+================================================================================
+7. TEST SUITE & VERIFICATION COVERAGE (40 TESTS)
+================================================================================
+The test suite consists of 40 automated unit and integration tests located in
+`backend/tests/` and `GraphRAG/tests/`. All 40 tests execute in < 1 second:
+
+Test Distribution:
+1. `backend/tests/test_collection_graphrag.py` (18 tests):
+   - Structured extraction of multiple relationships from a single chunk.
+   - Independent validation of each candidate relationship.
+   - Reuse of canonical entities across related documents in the same collection.
+   - Two distinct entities not merged by semantic clustering.
+   - Entity type incompatibility prevents invalid merges.
+   - Shared canonical entities connecting valid subgraphs.
+   - Unsupported edges not generated merely from cluster co-occurrence.
+   - Graph communities stored separately from entity identities.
+   - Multiple passages supporting the same claim.
+   - Conflicting claims remaining distinguishable with provenance.
+   - Evidence provenance surviving deduplication.
+   - Duplicate ingestion idempotency (content hash detection).
+   - Changed documents create correct revisions.
+   - Collection boundaries strictly respected during retrieval.
+   - Individual document graph retrieval compatibility.
+   - Collection-level graph retrieval.
+   - Existing question answering continues to function backwards-compatibly.
+   - Document identity and collection scope safety.
+2. `backend/tests/test_graphiti_rag_retrieval.py` (8 tests):
+   - Production QuestionService uses Graphiti retrieval without forcing GraphRAGStore.
+   - Explicit GraphRAGStore injection remains supported.
+   - Hybrid search activates all four categories (edges, nodes, episodes, communities).
+   - Search uses normalized collection/group IDs.
+   - Search results preserve all categories and multiple supporting episodes.
+   - Episode UUID maps back to passage and reaches the LLM prompt.
+   - Async ingestion uses the shared GraphitiAdapter.
+   - PDF page range parameters passed correctly to loader.
+   - API evidence contract compatibility.
+3. `backend/tests/test_graph_question_service.py` (2 tests):
+   - Retriever returns answers and formatted evidence.
+   - Production service uses Graphiti retrieval.
+4. `backend/tests/test_graphiti_integration.py` (3 tests):
+   - Group ID normalization is collection-scoped and stable.
+   - GraphitiAdapter ingests chunks as grouped episodes.
+   - Search uses SearchConfig limits.
+5. `backend/tests/test_pdf_graph_service.py` (4 tests):
+   - Document loader reads TXT in overlapping chunks.
+   - Document loader extracts PDF and DOCX text.
+   - Extractor validates relationships from text.
+   - Extractor rejects ungrounded evidence.
+6. `GraphRAG/tests/test_evaluation_metrics.py` (2 tests):
+   - Entity resolution precision, recall, and F1 metrics.
+   - Relationship extraction and negation detection metrics.
+7. `GraphRAG/tests/test_graph_rag_core.py` (3 tests):
+   - Configuration validation rejects invalid values.
+   - Text cleaning and chunking preserve content integrity.
+   - Embedding validation rejects malformed vectors.
+
+Run the test suite with:
+  PYTHONPATH=backend:. pytest backend/tests/ GraphRAG/tests/ -v
+
+================================================================================
+8. DEPLOYMENT, OPERATIONAL RUNBOOK & TROUBLESHOOTING
+================================================================================
+
+8.1 STARTING SERVICES
+Step 1: Start Neo4j
+  docker compose up -d
+  Verify: docker compose ps (container graphrag-neo4j running on ports 7474 and 7687)
+
+Step 2: Start Ollama & Download Models
+  ollama serve &
+  ollama pull llama3.2
+  ollama pull embeddinggemma
+
+Step 3: Run Backend Service
+  source .venv/bin/activate
+  PYTHONPATH=backend:. python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+Step 4: Run Frontend Development Server
+  cd frontend
+  npm install
+  npm run dev -- --host 0.0.0.0
+  Open http://localhost:5173
+
+8.2 COMMON TROUBLESHOOTING
+1. Neo4j Connection Refused:
+   - Ensure the Docker container is active: `docker compose ps`.
+   - Verify credentials in `.env` match `NEO4J_USER` and `NEO4J_PASSWORD`.
+2. Ollama Model Not Found:
+   - Execute `ollama list` and confirm both `llama3.2` and `embeddinggemma` are installed.
+3. Module Not Found (app / GraphRAG):
+   - Ensure `PYTHONPATH` includes both `backend` and the root repository path:
+     `export PYTHONPATH=backend:.`
+4. Port 5173 or 8000 Already in Use:
+   - Terminate old processes using `lsof -i :8000` or specify a new port via uvicorn `--port 8001`.

@@ -34,24 +34,50 @@ def test_retriever_returns_answer_and_evidence(monkeypatch):
     assert result["evidence"][0]["documentName"] == "biology.pdf"
 
 
-def test_question_service_uses_native_store_for_collection_queries(monkeypatch):
-    class DummyStore:
-        def close(self):
-            pass
+def test_production_question_service_uses_graphiti_retrieval_without_graphragstore(monkeypatch):
+    """Production QuestionService must use Graphiti retrieval and must NOT inject GraphRAGStore."""
+    from app.services.question_service import QuestionService
+    from GraphRAG.graphiti_integration import GraphitiAdapter
 
-    captured = {}
+    class FakeAdapter(GraphitiAdapter):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
 
-    async def fake_answer_question_async(question, *, collection_id=None, store=None):
-        captured["question"] = question
-        captured["collection_id"] = collection_id
-        captured["store"] = store
-        return {"answer": "ok", "path": {"nodes": [], "edges": []}, "evidence": []}
+        async def search_async(self, query, *, collection_id=None, limit=10):
+            self.calls.append({"query": query, "collection_id": collection_id, "limit": limit})
+            return {
+                "edges": [],
+                "nodes": [],
+                "episodes": [],
+                "communities": [],
+                "passages": [
+                    {
+                        "passage_id": "pass-1",
+                        "document_name": "cell.txt",
+                        "text": "A cell is the basic structural and functional unit of life.",
+                        "page": None,
+                        "collection_id": collection_id,
+                    }
+                ],
+            }
 
-    monkeypatch.setattr("app.services.question_service.GraphRAGStore", lambda: DummyStore())
-    monkeypatch.setattr("app.services.question_service.answer_question_async", fake_answer_question_async)
+    fake_adapter = FakeAdapter()
+    service = QuestionService(adapter=fake_adapter)
 
-    result = asyncio.run(__import__("app.services.question_service", fromlist=["service"]).service.ask_async("What is a cell?", collection_id="cell_biology"))
+    # Verify no GraphRAGStore is instantiated during production ask
+    def forbidden_store(*args, **kwargs):
+        raise AssertionError("GraphRAGStore should not be instantiated during production QuestionService retrieval.")
 
-    assert result["answer"] == "ok"
-    assert captured["collection_id"] == "cell_biology"
-    assert isinstance(captured["store"], DummyStore)
+    monkeypatch.setattr("GraphRAG.retriever.generate_text", lambda prompt, system_prompt, model, max_tokens: "A cell is the basic unit of life.")
+    monkeypatch.setattr("GraphRAG.retriever.embed_question", lambda q: [1.0, 0.0])
+
+    result = asyncio.run(service.ask_async("What is a cell?", collection_id="cell_biology"))
+
+    assert result["answer"] == "A cell is the basic unit of life."
+    assert len(fake_adapter.calls) == 1
+    assert fake_adapter.calls[0]["query"] == "What is a cell?"
+    assert fake_adapter.calls[0]["collection_id"] == "cell_biology"
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["documentName"] == "cell.txt"
+    assert result["evidence"][0]["text"] == "A cell is the basic structural and functional unit of life."

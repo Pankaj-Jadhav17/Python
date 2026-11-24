@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -28,6 +29,7 @@ try:
     from graphiti_core.llm_client import LLMConfig
     from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
     from graphiti_core.search.search_config import SearchConfig
+    from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
 except ImportError:  # pragma: no cover
     Graphiti = None
     OpenAIRerankerClient = None
@@ -37,6 +39,7 @@ except ImportError:  # pragma: no cover
     LLMConfig = None
     OpenAIGenericClient = None
     SearchConfig = None
+    COMBINED_HYBRID_SEARCH_RRF = None
 
 
 def normalize_group_id(value: str | None, *, default: str = "default") -> str:
@@ -414,70 +417,506 @@ class GraphitiAdapter:
                 return str(uuid)
             return record["name"] or (record["labels"][0] if record.get("labels") else str(uuid))
 
-    async def search_async(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    def get_passages_by_ids(
+        self,
+        passage_ids: list[str],
+        *,
+        collection_id: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-retrieve Passage nodes and their Document metadata in a single collection-scoped query."""
+        if not passage_ids or not self.supports_live_metadata:
+            return {}
+        cleaned_ids = [str(pid) for pid in passage_ids if pid and str(pid).strip()]
+        if not cleaned_ids:
+            return {}
+
+        cid = normalize_group_id(collection_id, default="default") if collection_id else None
+        query = """
+        MATCH (p:Passage)
+        WHERE p.id IN $passage_ids AND ($collection_id IS NULL OR p.collection_id = $collection_id)
+        OPTIONAL MATCH (d:Document {id: p.document_id})
+        RETURN p.id AS passage_id,
+               p.document_id AS document_id,
+               coalesce(p.document_name, d.document_name, "") AS document_name,
+               p.collection_id AS collection_id,
+               p.chunk_index AS chunk_index,
+               p.page AS page,
+               p.text AS text,
+               p.content_hash AS content_hash
+        """
+        try:
+            with self.neo4j_driver.session() as session:
+                records = list(session.run(query, passage_ids=cleaned_ids, collection_id=cid))
+                return {r["passage_id"]: dict(r) for r in records if r.get("passage_id")}
+        except Exception:
+            logger.warning("Graphiti passage metadata batch lookup failed; continuing without Neo4j passage metadata.", exc_info=True)
+            return {}
+
+    async def search_async(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> dict[str, Any]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("Search query must not be empty.")
-        group_ids = [normalize_group_id(collection_id)] if collection_id else None
+        norm_collection_id = normalize_group_id(collection_id) if collection_id else None
+        group_ids = [norm_collection_id] if norm_collection_id else None
         search_fn = getattr(self.graphiti, "search_", None) or getattr(self.graphiti, "search", None)
         if search_fn is None:
             raise RuntimeError("Graphiti client does not support search operations.")
 
         if hasattr(self.graphiti, "search_"):
-            if SearchConfig is not None:
+            if COMBINED_HYBRID_SEARCH_RRF is not None:
+                search_config = COMBINED_HYBRID_SEARCH_RRF.model_copy(deep=True)
+                search_config.limit = limit
+            elif SearchConfig is not None:
+                search_config = SearchConfig(limit=limit)
+            else:
+                search_config = None
+
+            if search_config is not None:
                 results = await self._maybe_await(
-                    search_fn(query.strip(), group_ids=group_ids, config=SearchConfig(limit=limit))
+                    search_fn(query.strip(), group_ids=group_ids, config=search_config)
                 )
             else:
                 results = await self._maybe_await(search_fn(query.strip(), group_ids=group_ids))
-            items = getattr(results, "edges", []) or []
-            nodes = {getattr(node, "uuid", None): node for node in getattr(results, "nodes", []) or []}
-            episodes = {getattr(episode, "uuid", None): episode for episode in getattr(results, "episodes", []) or []}
         else:
             results = await self._maybe_await(search_fn(query.strip(), group_ids=group_ids, num_results=limit))
-            items = results or []
-            nodes = {}
-            episodes = {}
 
-        edges: list[dict[str, Any]] = []
-        for item in items:
-            source_uuid = getattr(item, "source_node_uuid", None)
-            target_uuid = getattr(item, "target_node_uuid", None)
-            source_name = self._resolve_node_name(source_uuid)
-            target_name = self._resolve_node_name(target_uuid)
-            evidence_text = getattr(item, "fact", "") or getattr(item, "summary", "") or ""
-            episode_uuid = None
-            if getattr(item, "episodes", None):
-                episode_uuid = item.episodes[0] if isinstance(item.episodes, list) else item.episodes
-            episode_record = episodes.get(episode_uuid) if episode_uuid else None
-            document_name = ""
-            passage_id = ""
-            page = None
-            if episode_record is not None:
-                document_name = getattr(episode_record, "source_description", "") or ""
-                passage_id = getattr(episode_record, "uuid", "") or ""
-                if not passage_id and getattr(episode_record, "episode_metadata", None):
-                    passage_id = str(episode_record.episode_metadata.get("passage_id", ""))
-            if not document_name:
-                document_name = getattr(item, "document_name", "") or ""
-            if not passage_id:
-                passage_id = getattr(item, "passage_id", "") or ""
-            if page is None:
-                page = getattr(item, "page", None)
-            edges.append({
+        def _get_val(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        def _prop(item: Any, *keys: str, default: Any = None) -> Any:
+            for k in keys:
+                if isinstance(item, dict):
+                    val = item.get(k)
+                else:
+                    val = getattr(item, k, None)
+                if val is not None:
+                    return val
+            return default
+
+        raw_edges = _get_val(results, "edges", []) or []
+        edge_scores = _get_val(results, "edge_reranker_scores", []) or []
+        raw_nodes = _get_val(results, "nodes", []) or []
+        node_scores = _get_val(results, "node_reranker_scores", []) or []
+        raw_episodes = _get_val(results, "episodes", []) or []
+        episode_scores = _get_val(results, "episode_reranker_scores", []) or []
+        raw_communities = _get_val(results, "communities", []) or []
+        comm_scores = _get_val(results, "community_reranker_scores", []) or []
+
+        # 1. Format Nodes
+        nodes_dict: dict[str, dict[str, Any]] = {}
+        formatted_nodes: list[dict[str, Any]] = []
+        for idx, node in enumerate(raw_nodes):
+            uuid_val = str(_prop(node, "uuid", "id", default="") or "")
+            name_val = str(_prop(node, "name", "label", default="") or "")
+            labels = _prop(node, "labels", default=None) or ["Entity"]
+            node_type = labels[0] if labels else "Entity"
+            score_val = node_scores[idx] if idx < len(node_scores) else _prop(node, "score")
+            summary_val = str(_prop(node, "summary", default="") or "")
+            formatted_node = {
+                "id": uuid_val or name_val,
+                "uuid": uuid_val,
+                "name": name_val,
+                "label": name_val or summary_val or uuid_val,
+                "type": node_type,
+                "summary": summary_val,
+                "group_id": _prop(node, "group_id", default=norm_collection_id),
+                "score": score_val,
+            }
+            formatted_nodes.append(formatted_node)
+            if uuid_val:
+                nodes_dict[uuid_val] = formatted_node
+            elif name_val:
+                nodes_dict[name_val] = formatted_node
+
+        # 2. Format Communities
+        formatted_communities: list[dict[str, Any]] = []
+        for idx, comm in enumerate(raw_communities):
+            comm_uuid = str(_prop(comm, "uuid", "id", default="") or "")
+            name_val = str(_prop(comm, "name", default="") or "")
+            score_val = comm_scores[idx] if idx < len(comm_scores) else _prop(comm, "score")
+            formatted_communities.append({
+                "id": comm_uuid or name_val,
+                "uuid": comm_uuid,
+                "name": name_val,
+                "summary": str(_prop(comm, "summary", default="") or ""),
+                "score": score_val,
+                "group_id": _prop(comm, "group_id", default=norm_collection_id),
+            })
+
+        # 3. Format Episodes
+        formatted_episodes: list[dict[str, Any]] = []
+        episodes_by_uuid: dict[str, dict[str, Any]] = {}
+        for idx, ep in enumerate(raw_episodes):
+            ep_uuid = str(_prop(ep, "uuid", "id", "passage_id", default="") or "")
+            if not ep_uuid:
+                ep_uuid = f"episode-{idx}"
+            score_val = episode_scores[idx] if idx < len(episode_scores) else _prop(ep, "score")
+            content_val = str(_prop(ep, "content", "body", "episode_body", "text", default="") or "")
+            source_desc = str(_prop(ep, "source_description", "description", default="") or "")
+            name_val = str(_prop(ep, "name", "title", default="") or "")
+            ep_item = {
+                "uuid": ep_uuid,
+                "name": name_val,
+                "content": content_val,
+                "source_description": source_desc,
+                "score": score_val,
+                "group_id": _prop(ep, "group_id", "collection_id", default=norm_collection_id),
+            }
+            formatted_episodes.append(ep_item)
+            if ep_uuid:
+                episodes_by_uuid[ep_uuid] = ep_item
+
+        # 4. Format Edges and collect episode UUIDs
+        all_episode_uuids: set[str] = set(episodes_by_uuid.keys())
+        formatted_edges: list[dict[str, Any]] = []
+
+        for idx, edge in enumerate(raw_edges):
+            edge_uuid = str(_prop(edge, "uuid", "id", default="") or "")
+            source_uuid = _prop(edge, "source_node_uuid", "source", default=None)
+            target_uuid = _prop(edge, "target_node_uuid", "target", default=None)
+
+            if str(source_uuid) in nodes_dict:
+                source_name = nodes_dict[str(source_uuid)]["name"]
+            elif source_uuid:
+                source_name = self._resolve_node_name(source_uuid)
+            else:
+                source_name = "unknown"
+
+            if str(target_uuid) in nodes_dict:
+                target_name = nodes_dict[str(target_uuid)]["name"]
+            elif target_uuid:
+                target_name = self._resolve_node_name(target_uuid)
+            else:
+                target_name = "unknown"
+
+            score_val = edge_scores[idx] if idx < len(edge_scores) else _prop(edge, "score")
+            fact_text = str(_prop(edge, "fact", "summary", "evidence", default="") or "")
+            relation_val = str(_prop(edge, "name", "relation", "label", default="related_to") or "related_to")
+
+            raw_edge_eps = _prop(edge, "episodes", "passage_ids", default=[]) or []
+            if isinstance(raw_edge_eps, list):
+                edge_episodes = [str(ep) for ep in raw_edge_eps if ep]
+            elif raw_edge_eps:
+                edge_episodes = [str(raw_edge_eps)]
+            else:
+                edge_episodes = []
+
+            for ep_id in edge_episodes:
+                all_episode_uuids.add(ep_id)
+
+            formatted_edges.append({
+                "id": edge_uuid or f"{source_name}->{target_name}:{relation_val}",
+                "uuid": edge_uuid,
                 "source": source_name,
                 "target": target_name,
-                "relation": getattr(item, "name", "related_to"),
-                "evidence": evidence_text,
-                "confidence": getattr(item, "confidence", None) or 0.0,
-                "status": "unknown",
-                "documentName": document_name,
-                "passageId": passage_id,
-                "page": page,
-                "collection_id": getattr(item, "group_id", None) or collection_id,
+                "relation": relation_val,
+                "evidence": fact_text,
+                "confidence": _prop(edge, "confidence", default=0.0) or 0.0,
+                "score": score_val,
+                "status": "verified" if fact_text else "unknown",
+                "episodes": edge_episodes,
+                "passage_ids": edge_episodes,
+                "collection_id": _prop(edge, "group_id", "collection_id", default=norm_collection_id),
             })
-        return edges
 
-    def search(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        # 5. Batch-retrieve Passage metadata for all collected episode UUIDs
+        passage_metadata = self.get_passages_by_ids(list(all_episode_uuids), collection_id=norm_collection_id)
+
+        # 6. Build passage evidence items connected with original document metadata
+        retrieved_passages: list[dict[str, Any]] = []
+        seen_passage_ids: set[str] = set()
+
+        for idx, ep in enumerate(formatted_episodes):
+            p_id = ep["uuid"]
+            meta = passage_metadata.get(p_id, {})
+            doc_name = meta.get("document_name") or ""
+            if not doc_name and ep.get("source_description"):
+                m = re.search(r"Document '([^']+)'", ep["source_description"])
+                if m:
+                    doc_name = m.group(1)
+            passage_text = meta.get("text") or ep.get("content") or ""
+            page_val = meta.get("page")
+
+            # Preserves original episode content even if passage metadata lookup fails
+            if passage_text.strip():
+                dedup_key = p_id or f"ep-{idx}"
+                if dedup_key not in seen_passage_ids:
+                    seen_passage_ids.add(dedup_key)
+                    retrieved_passages.append({
+                        "passage_id": p_id,
+                        "passageId": p_id,
+                        "episode_id": p_id,
+                        "document_id": meta.get("document_id") or "",
+                        "document_name": doc_name,
+                        "documentName": doc_name,
+                        "collection_id": meta.get("collection_id") or ep.get("group_id") or norm_collection_id,
+                        "text": passage_text,
+                        "evidence": passage_text,
+                        "chunk_index": meta.get("chunk_index"),
+                        "page": page_val,
+                        "score": ep.get("score"),
+                    })
+
+        # Attach metadata to edges and preserve multiple supporting episodes
+        for edge_item in formatted_edges:
+            edge_records: list[dict[str, Any]] = []
+            for ep_id in edge_item["episodes"]:
+                meta = passage_metadata.get(ep_id, {})
+                ep_content = episodes_by_uuid.get(ep_id, {}).get("content", "")
+                p_text = meta.get("text") or ep_content or edge_item["evidence"]
+                doc_name = meta.get("document_name") or ""
+                if not doc_name and ep_id in episodes_by_uuid:
+                    m = re.search(r"Document '([^']+)'", episodes_by_uuid[ep_id].get("source_description", ""))
+                    if m:
+                        doc_name = m.group(1)
+                page_val = meta.get("page")
+                rec = {
+                    "passage_id": ep_id,
+                    "passageId": ep_id,
+                    "document_name": doc_name,
+                    "documentName": doc_name,
+                    "page": page_val,
+                    "evidence": p_text,
+                    "text": p_text,
+                    "confidence": edge_item.get("confidence", 0.0),
+                    "status": edge_item.get("status", "unknown"),
+                }
+                edge_records.append(rec)
+                if ep_id and ep_id not in seen_passage_ids and p_text.strip():
+                    seen_passage_ids.add(ep_id)
+                    retrieved_passages.append({
+                        "passage_id": ep_id,
+                        "passageId": ep_id,
+                        "episode_id": ep_id,
+                        "document_id": meta.get("document_id") or "",
+                        "document_name": doc_name,
+                        "documentName": doc_name,
+                        "collection_id": meta.get("collection_id") or norm_collection_id,
+                        "text": p_text,
+                        "evidence": p_text,
+                        "chunk_index": meta.get("chunk_index"),
+                        "page": page_val,
+                        "score": edge_item.get("score"),
+                    })
+
+            edge_item["evidence_records"] = edge_records
+            edge_item["document_names"] = list({r["document_name"] for r in edge_records if r.get("document_name")})
+            if edge_records and not edge_item.get("documentName"):
+                edge_item["documentName"] = edge_records[0].get("document_name")
+            if edge_records and edge_item.get("page") is None:
+                edge_item["page"] = edge_records[0].get("page")
+            if edge_records and not edge_item.get("passageId"):
+                edge_item["passageId"] = edge_records[0].get("passage_id")
+
+        # 7. Merge any pre-retrieved passages present in results
+        results_passages = _get_val(results, "passages", []) or []
+        for rp in results_passages:
+            p_id = str(_prop(rp, "passage_id", "passageId", "episode_id", default="") or "")
+            p_text = str(_prop(rp, "text", "evidence", default="") or "")
+            if not p_text.strip():
+                continue
+            dedup_key = p_id or f"raw-pass-{len(retrieved_passages)}"
+            if dedup_key not in seen_passage_ids:
+                seen_passage_ids.add(dedup_key)
+                doc_n = str(_prop(rp, "document_name", "documentName", default="") or "")
+                retrieved_passages.append({
+                    "passage_id": p_id,
+                    "passageId": p_id,
+                    "episode_id": p_id,
+                    "document_id": str(_prop(rp, "document_id", default="") or ""),
+                    "document_name": doc_n,
+                    "documentName": doc_n,
+                    "collection_id": _prop(rp, "collection_id", default=norm_collection_id),
+                    "text": p_text,
+                    "evidence": p_text,
+                    "chunk_index": _prop(rp, "chunk_index"),
+                    "page": _prop(rp, "page"),
+                    "score": _prop(rp, "score"),
+                })
+
+        # 8. If Graphiti returned no episodes or passages, query stored collection passages from Neo4j
+        if not retrieved_passages and not formatted_episodes and self.supports_live_metadata:
+            try:
+                passages_from_db = self._search_passages_in_neo4j(query, collection_id=norm_collection_id, limit=limit)
+                for p_item in passages_from_db:
+                    pid = p_item.get("passage_id")
+                    if pid and pid not in seen_passage_ids:
+                        seen_passage_ids.add(pid)
+                        retrieved_passages.append(p_item)
+
+                if retrieved_passages and not formatted_edges:
+                    pids = [p["passage_id"] for p in retrieved_passages if p.get("passage_id")]
+                    extra_edges, extra_nodes = self._find_connected_graph_for_passages(pids, collection_id=norm_collection_id)
+                    formatted_edges.extend(extra_edges)
+                    for n in extra_nodes:
+                        if n["id"] not in nodes_dict:
+                            nodes_dict[n["id"]] = n
+                            formatted_nodes.append(n)
+            except Exception:
+                logger.warning("Fallback passage retrieval from Neo4j encountered an error; continuing.", exc_info=True)
+
+        return {
+            "edges": formatted_edges,
+            "nodes": formatted_nodes,
+            "episodes": formatted_episodes,
+            "communities": formatted_communities,
+            "passages": retrieved_passages,
+        }
+
+    def _search_passages_in_neo4j(
+        self,
+        query: str,
+        *,
+        collection_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Search Neo4j Passage nodes for a collection using vector cosine similarity or text overlap."""
+        if not self.supports_live_metadata:
+            return []
+        try:
+            with self.neo4j_driver.session() as session:
+                records = list(session.run(
+                    """
+                    MATCH (p:Passage)
+                    WHERE ($collection_id IS NULL OR p.collection_id = $collection_id)
+                    RETURN p.id AS passage_id,
+                           p.document_id AS document_id,
+                           p.document_name AS document_name,
+                           p.collection_id AS collection_id,
+                           p.chunk_index AS chunk_index,
+                           p.page AS page,
+                           p.text AS text,
+                           p.embedding AS embedding
+                    """,
+                    collection_id=collection_id,
+                ))
+        except Exception:
+            logger.warning("Could not query passages from Neo4j.", exc_info=True)
+            return []
+
+        if not records:
+            return []
+
+        scored: list[dict[str, Any]] = []
+        q_vec = None
+        q_norm = 0.0
+        try:
+            from .embeddings import embed_question
+            q_vec = embed_question(query)
+            q_norm = math.sqrt(sum(v * v for v in q_vec))
+        except Exception:
+            q_vec = None
+            q_norm = 0.0
+
+        q_lower = query.lower()
+        q_words = [w for w in re.findall(r"\w+", q_lower) if len(w) > 2]
+
+        for record in records:
+            r = dict(record)
+            p_text = r.get("text") or ""
+            if not p_text.strip():
+                continue
+
+            p_vec = r.pop("embedding", None)
+            if q_vec and p_vec and len(p_vec) == len(q_vec) and q_norm > 0:
+                dot = sum(a * b for a, b in zip(q_vec, p_vec))
+                p_norm = math.sqrt(sum(v * v for v in p_vec))
+                score = dot / (q_norm * p_norm) if (q_norm * p_norm) > 0 else 0.0
+            else:
+                p_lower = p_text.lower()
+                matches = sum(1 for w in q_words if w in p_lower)
+                score = (matches / len(q_words)) if q_words else 0.0
+
+            scored.append({
+                "passage_id": r["passage_id"],
+                "passageId": r["passage_id"],
+                "episode_id": r["passage_id"],
+                "document_id": r.get("document_id") or "",
+                "document_name": r.get("document_name") or "",
+                "documentName": r.get("document_name") or "",
+                "collection_id": r.get("collection_id") or collection_id,
+                "text": p_text,
+                "evidence": p_text,
+                "chunk_index": r.get("chunk_index"),
+                "page": r.get("page"),
+                "score": score,
+            })
+
+        scored.sort(reverse=True, key=lambda x: x["score"])
+        return scored[:limit]
+
+    def _find_connected_graph_for_passages(
+        self,
+        passage_ids: list[str],
+        *,
+        collection_id: str | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Find connected Concept nodes and RELATES edges in Neo4j for retrieved passages."""
+        if not passage_ids or not self.supports_live_metadata:
+            return [], []
+        edges: list[dict[str, Any]] = []
+        nodes: list[dict[str, Any]] = []
+        seen_nodes: set[str] = set()
+        try:
+            with self.neo4j_driver.session() as session:
+                records = list(session.run(
+                    """
+                    MATCH (p:Passage)-[:MENTIONS]->(c:Concept)
+                    WHERE p.id IN $passage_ids
+                    MATCH (c)-[r:RELATES]->(target:Concept)
+                    WHERE ($collection_id IS NULL OR r.collection_id = $collection_id)
+                    RETURN c.canonical_name AS source,
+                           target.canonical_name AS target,
+                           coalesce(r.relation, 'related_to') AS relation,
+                           coalesce(r.evidence, '') AS evidence,
+                           r.confidence AS confidence,
+                           r.document_name AS document_name,
+                           r.page AS page,
+                           r.passage_ids AS passage_ids
+                    LIMIT 20
+                    """,
+                    passage_ids=passage_ids,
+                    collection_id=collection_id,
+                ))
+                for row in records:
+                    src = row.get("source")
+                    tgt = row.get("target")
+                    if src and tgt:
+                        edge = {
+                            "id": f"{src}->{tgt}:{row.get('relation')}",
+                            "source": src,
+                            "target": tgt,
+                            "relation": row.get("relation"),
+                            "evidence": row.get("evidence"),
+                            "confidence": row.get("confidence") or 0.0,
+                            "episodes": row.get("passage_ids") or [],
+                            "passage_ids": row.get("passage_ids") or [],
+                            "documentName": row.get("document_name") or "",
+                            "document_name": row.get("document_name") or "",
+                            "page": row.get("page"),
+                            "evidence_records": [{
+                                "evidence": row.get("evidence") or "",
+                                "document_name": row.get("document_name") or "",
+                                "page": row.get("page"),
+                                "confidence": row.get("confidence") or 0.0,
+                            }],
+                        }
+                        edges.append(edge)
+                    for n_name in (src, tgt):
+                        if n_name and n_name not in seen_nodes:
+                            seen_nodes.add(n_name)
+                            nodes.append({
+                                "id": n_name,
+                                "name": n_name,
+                                "label": n_name,
+                                "type": "Concept",
+                            })
+        except Exception:
+            logger.warning("Could not query connected concepts in Neo4j; continuing with empty edges.", exc_info=True)
+        return edges, nodes
+
+    def search(self, query: str, *, collection_id: str | None = None, limit: int = 10) -> dict[str, Any]:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -522,14 +961,19 @@ class GraphitiAdapter:
             logger.warning("Graphiti graph query failed; returning an empty graph payload.", exc_info=True)
             return {"nodes": [], "edges": []}
 
+        def _extract_id(entity: Any) -> str:
+            if entity is None:
+                return ""
+            return str(getattr(entity, "element_id", None) or getattr(entity, "id", None) or "")
+
         for record in records:
             left = record.get("n")
             rel = record.get("r")
             right = record.get("m")
             if left is not None:
-                node_key = left.get("uuid") or left.get("id") or left.get("name") or str(left.id)
+                node_key = left.get("uuid") or left.get("id") or left.get("name") or _extract_id(left)
                 node_name = left.get("name") or left.get("document_name") or left.get("id") or str(node_key)
-                node_type = next(iter(left.labels), "Node") if hasattr(left, "labels") else "Node"
+                node_type = next(iter(left.labels), "Node") if hasattr(left, "labels") and left.labels else "Node"
                 nodes[node_key] = {
                     "id": node_key,
                     "label": node_name,
@@ -538,9 +982,9 @@ class GraphitiAdapter:
                     "collection_id": left.get("collection_id") or left.get("group_id"),
                 }
             if right is not None:
-                right_key = right.get("uuid") or right.get("id") or right.get("name") or str(right.id)
+                right_key = right.get("uuid") or right.get("id") or right.get("name") or _extract_id(right)
                 right_name = right.get("name") or right.get("document_name") or right.get("id") or str(right_key)
-                right_type = next(iter(right.labels), "Node") if hasattr(right, "labels") else "Node"
+                right_type = next(iter(right.labels), "Node") if hasattr(right, "labels") and right.labels else "Node"
                 nodes[right_key] = {
                     "id": right_key,
                     "label": right_name,
@@ -549,8 +993,8 @@ class GraphitiAdapter:
                     "collection_id": right.get("collection_id") or right.get("group_id"),
                 }
             if rel is not None and left is not None and right is not None:
-                source_id = left.get("uuid") or left.get("id") or left.get("name") or str(left.id)
-                target_id = right.get("uuid") or right.get("id") or right.get("name") or str(right.id)
+                source_id = left.get("uuid") or left.get("id") or left.get("name") or _extract_id(left)
+                target_id = right.get("uuid") or right.get("id") or right.get("name") or _extract_id(right)
                 edges.append({
                     "id": f"{source_id}->{target_id}:{rel.type}",
                     "source": source_id,
@@ -564,11 +1008,18 @@ class GraphitiAdapter:
         return {"nodes": list(nodes.values()), "edges": edges}
 
 
-adapter = GraphitiAdapter()
-
-
 def get_shared_graphiti_adapter() -> GraphitiAdapter:
     global _SHARED_GRAPHITI_ADAPTER
     if _SHARED_GRAPHITI_ADAPTER is None:
         _SHARED_GRAPHITI_ADAPTER = GraphitiAdapter()
     return _SHARED_GRAPHITI_ADAPTER
+
+
+class _SharedAdapterProxy:
+    """Proxy providing backward compatibility for module-level `adapter` imports."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_shared_graphiti_adapter(), name)
+
+
+adapter = _SharedAdapterProxy()

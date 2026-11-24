@@ -39,13 +39,14 @@ async def upload_document(
         temp_file.close()
 
         try:
-            service.check_ollama()
-            result = await run_in_threadpool(
-                service.ingest,
+            await run_in_threadpool(service.check_ollama)
+            result = await service.ingest_async(
                 temp_file.name,
                 document_name=file.filename,
                 collection_id=collection_id,
                 collection_name=collection_name,
+                start_page=start_page,
+                end_page=end_page,
             )
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error

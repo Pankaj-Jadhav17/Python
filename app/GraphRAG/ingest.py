@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -8,16 +9,14 @@ from typing import Any
 from app.config import config
 from .db import GraphRAGStore
 from .document_loader import extract_document_text
-from .graphiti_integration import GraphitiAdapter
+from .graphiti_integration import GraphitiAdapter, get_shared_graphiti_adapter
 from .utils.text_utils import clean_text, chunk_text
 
 logger = logging.getLogger(__name__)
 
-_graphiti_adapter = GraphitiAdapter()
-
 
 def _safe_document_id(document_name: str, text: str | None = None, collection_id: str = "default") -> str:
-    return _graphiti_adapter._document_hash_key(document_name, text, collection_id)
+    return get_shared_graphiti_adapter()._document_hash_key(document_name, text, collection_id)
 
 
 def ingest_document_text(
@@ -88,7 +87,7 @@ def ingest_document_text(
             "graph": graph,
         }
 
-    return _graphiti_adapter.ingest_document_text(
+    return get_shared_graphiti_adapter().ingest_document_text(
         document_name,
         text,
         collection_id=collection_id,
@@ -117,7 +116,7 @@ async def ingest_document_text_async(
             document_id=document_id,
             store=store,
         )
-    return await _graphiti_adapter.ingest_document_text_async(
+    return await get_shared_graphiti_adapter().ingest_document_text_async(
         document_name,
         text,
         collection_id=collection_id,
@@ -133,6 +132,8 @@ def ingest_file(
     document_name: str | None = None,
     collection_id: str | None = None,
     collection_name: str | None = None,
+    start_page: int | None = None,
+    end_page: int | None = None,
     store: GraphRAGStore | None = None,
 ) -> dict[str, Any]:
     """Ingest a file from disk into a collection."""
@@ -146,7 +147,7 @@ def ingest_file(
     if extension in {".txt", ".md"}:
         text = path.read_text(encoding="utf-8", errors="replace")
     elif extension in {".pdf", ".docx"}:
-        text = extract_document_text(str(path), extension)
+        text = extract_document_text(str(path), extension, start_page=start_page, end_page=end_page)
     else:
         raise ValueError(f"Unsupported document type: {extension}")
 
@@ -168,9 +169,11 @@ async def ingest_file_async(
     document_name: str | None = None,
     collection_id: str | None = None,
     collection_name: str | None = None,
+    start_page: int | None = None,
+    end_page: int | None = None,
     store: GraphRAGStore | None = None,
 ) -> dict[str, Any]:
-    """Async file ingestion wrapper."""
+    """Async file ingestion wrapper offloading extraction to worker thread."""
     if not file_path:
         raise ValueError("A file path is required.")
     path = Path(file_path)
@@ -178,12 +181,16 @@ async def ingest_file_async(
         raise FileNotFoundError(f"File not found: {file_path}")
 
     extension = path.suffix.lower()
-    if extension in {".txt", ".md"}:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    elif extension in {".pdf", ".docx"}:
-        text = extract_document_text(str(path), extension)
-    else:
-        raise ValueError(f"Unsupported document type: {extension}")
+
+    def _extract() -> str:
+        if extension in {".txt", ".md"}:
+            return path.read_text(encoding="utf-8", errors="replace")
+        elif extension in {".pdf", ".docx"}:
+            return extract_document_text(str(path), extension, start_page=start_page, end_page=end_page)
+        else:
+            raise ValueError(f"Unsupported document type: {extension}")
+
+    text = await asyncio.to_thread(_extract)
 
     if not text or not text.strip():
         raise ValueError("No readable text was found in the uploaded document.")
