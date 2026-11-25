@@ -624,3 +624,86 @@ def test_scenario_8_collection_isolation():
 
     assert res2["evidence"][0]["collection_id"] == "chemistry"
     assert res2["evidence"][0]["documentName"] == "chemistry_doc.pdf"
+
+
+def test_prompt_separates_user_question_and_retrieved_context_with_entities(monkeypatch):
+    """Prompt explicitly separates User Question and Retrieved Context (passages, entities, relationships)."""
+    captured_calls = []
+
+    def mock_generate(prompt, system_prompt=None, model=None, max_tokens=None):
+        captured_calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        if "What is a cell?" in prompt:
+            return "A cell is the basic structural and functional unit of life (biology.pdf)."
+        return "Mitochondria produce ATP (biology.pdf)."
+
+    monkeypatch.setattr("GraphRAG.retriever.generate_text", mock_generate)
+
+    class FakeAdapter(GraphitiAdapter):
+        async def search_async(self, query, *, collection_id=None, limit=10):
+            return {
+                "edges": [
+                    {
+                        "source": "Cell",
+                        "target": "Mitochondria",
+                        "relation": "contains",
+                        "evidence": "Eukaryotic cells contain mitochondria.",
+                    }
+                ],
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "name": "Cell",
+                        "type": "Concept",
+                        "summary": "Basic structural and functional unit of life.",
+                    },
+                    {
+                        "id": "n2",
+                        "name": "Mitochondria",
+                        "type": "Organelle",
+                        "summary": "Organelles that produce ATP.",
+                    },
+                ],
+                "episodes": [],
+                "communities": [],
+                "passages": [
+                    {
+                        "passage_id": "p-cell",
+                        "document_name": "biology.pdf",
+                        "page": 4,
+                        "chunk_index": 0,
+                        "text": "A cell is the basic structural and functional unit of living organisms.",
+                    },
+                    {
+                        "passage_id": "p-mito",
+                        "document_name": "biology.pdf",
+                        "page": 5,
+                        "chunk_index": 1,
+                        "text": "Mitochondria generate ATP through cellular respiration.",
+                    },
+                ],
+            }
+
+    service = QuestionService(adapter=FakeAdapter())
+    res_cell = asyncio.run(service.ask_async("What is a cell?", collection_id="bio"))
+    res_mito = asyncio.run(service.ask_async("What do mitochondria do?", collection_id="bio"))
+
+    assert len(captured_calls) == 2
+    p1 = captured_calls[0]["prompt"]
+    p2 = captured_calls[1]["prompt"]
+    sys_p = captured_calls[0]["system_prompt"]
+
+    for p, expected_q in ((p1, "What is a cell?"), (p2, "What do mitochondria do?")):
+        assert "User Question:\n" in p
+        assert "Retrieved Context:\n" in p
+        assert p.index("User Question:\n") < p.index("Retrieved Context:\n")
+        assert f"User Question:\n{expected_q}" in p
+        assert "--- RETRIEVED SOURCE PASSAGES ---" in p
+        assert "--- RETRIEVED ENTITIES ---" in p
+        assert "Cell (Concept): Basic structural and functional unit of life." in p
+        assert "--- GRAPH RELATIONSHIPS ---" in p
+        assert "Cell --[contains]--> Mitochondria" in p
+
+    assert "Do not simply summarize the retrieved passages" in sys_p
+    assert res_cell["answer"] != res_mito["answer"]
+    assert res_cell["evidence"][0]["documentName"] == "biology.pdf"
+    assert res_cell["evidence"][0]["page"] == 4

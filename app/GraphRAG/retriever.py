@@ -276,7 +276,7 @@ class GraphRAGRetriever:
                 "communities": [],
             }
 
-        # Build prompt using retrieved original source text as primary evidence and graph relations as context
+        # Build prompt with clearly separated User Question and Retrieved Context
         context_parts: list[str] = []
         if usable_evidence:
             context_parts.append("--- RETRIEVED SOURCE PASSAGES ---")
@@ -286,6 +286,22 @@ class GraphRAGRetriever:
                 chunk_str = f", Chunk {item['chunk_index'] + 1}" if item.get("chunk_index") is not None else ""
                 passage_text = item.get("text") or item.get("evidence") or ""
                 context_parts.append(f"[{idx}] Document: {doc_name}{page_str}{chunk_str}\n{passage_text}\n")
+
+        if nodes:
+            entity_lines: list[str] = []
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                n_name = str(node.get("name") or node.get("label") or node.get("id") or "").strip()
+                if not n_name:
+                    continue
+                n_type = str(node.get("type") or "").strip()
+                n_summary = str(node.get("summary") or "").strip()
+                label = f"{n_name} ({n_type})" if n_type else n_name
+                entity_lines.append(f"- {label}: {n_summary}" if n_summary else f"- {label}")
+            if entity_lines:
+                context_parts.append("--- RETRIEVED ENTITIES ---")
+                context_parts.extend(entity_lines)
 
         if flat_graph["edges"]:
             context_parts.append("--- GRAPH RELATIONSHIPS ---")
@@ -308,16 +324,19 @@ class GraphRAGRetriever:
                 if c_sum:
                     context_parts.append(f"- {c_name}: {c_sum}")
 
+        retrieved_context = "\n".join(context_parts)
         prompt = (
-            f"Question: {question}\n\n"
-            f"Context:\n"
-            f"{chr(10).join(context_parts)}\n\n"
+            "User Question:\n"
+            f"{question}\n\n"
+            "Retrieved Context:\n"
+            f"{retrieved_context}\n\n"
             "Instructions:\n"
-            "Answer the question using the retrieved source passages as primary evidence and graph relationships as supporting context.\n"
+            f'Directly answer the User Question ("{question}") using the Retrieved Context above as supporting evidence.\n'
+            "Focus strictly on what the User Question asks; do NOT merely summarize all retrieved passages or include unrelated context.\n"
             "Combine relevant information across multiple passages when multiple passages support the answer.\n"
-            "Cite the source document name for claims made where available.\n"
-            "If the provided evidence does not contain sufficient information to answer the question, clearly state that there is insufficient evidence in the knowledge graph.\n"
-            "Do not extrapolate, assume, or invent facts outside the retrieved evidence."
+            "Cite the source document name (and page/chunk when available) for claims made.\n"
+            "If the Retrieved Context does not contain sufficient information to answer the User Question, clearly state that there is insufficient evidence in the knowledge graph.\n"
+            "Do not extrapolate, assume, or invent facts outside the Retrieved Context."
         )
 
         logger.info(
@@ -331,9 +350,11 @@ class GraphRAGRetriever:
             answer_text = generate_text(
                 prompt,
                 system_prompt=(
-                    "You answer questions strictly from retrieved graph evidence and document passages. "
-                    "Combine relevant information when multiple passages support the answer. "
-                    "Never invent facts or use external knowledge. Always cite source documents."
+                    "You are a question-answering assistant grounded strictly in retrieved Graphiti evidence. "
+                    "You receive a User Question and Retrieved Context (passages, entities, and graph relationships). "
+                    "Answer the User Question directly using the Retrieved Context as supporting evidence. "
+                    "Do not simply summarize the retrieved passages or generate answers unrelated to the User Question. "
+                    "Combine relevant evidence across passages when needed, cite source documents, and never invent facts or use external knowledge."
                 ),
                 model=self.config.ollama_chat_model,
                 max_tokens=384,
